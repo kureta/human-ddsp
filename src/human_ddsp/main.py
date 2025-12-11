@@ -1,3 +1,5 @@
+# pyright: basic
+
 import os
 import random
 
@@ -9,7 +11,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torchaudio
 import torchaudio.transforms as T
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 # Optional: Polars for data loading
 try:
@@ -392,6 +394,35 @@ def convert_voice(model, input_wav, output_wav, target_gender_balance, target_ag
     torchaudio.save(output_wav, wet_audio, 16000)
     print(f"Saved: {output_wav}")
 
+def process_tsv(file_path, output_path):
+    # 1. Load the TSV file
+    # Polars uses read_csv with a separator argument for TSV
+    df = pl.read_csv(file_path, separator="\t", ignore_errors=True, encoding="utf-8", quote_char="")
+
+    # 2. Apply Filters
+    # - path is not null
+    # - age is not null
+    # - gender is exactly 'male' or 'female'
+    filtered_df = df.filter(
+        pl.col("path").is_not_null() &
+        pl.col("age").is_not_null() &
+        pl.col("gender").is_not_null()
+    ).select(["path", "age", "gender"])  # Discard everything else
+
+    # 3. Inspect results
+    print(f"Original rows: {len(df)}")
+    print(f"Filtered rows: {len(filtered_df)}")
+    print(filtered_df.head())
+
+    # Optional: Save back to TSV
+    filtered_df.write_csv(output_path)
+
+    # Extract unique values
+    unique_genders = filtered_df.select(pl.col("gender").unique()).to_series().to_list()
+    unique_ages = filtered_df.select(pl.col("age").unique()).to_series().to_list()
+
+    print("Unique Genders:", unique_genders)
+    print("Unique Ages:", unique_ages)
 
 # ==========================================
 # 5. Main Execution (Fixed: Batch Logging & Configs)
@@ -399,7 +430,8 @@ def convert_voice(model, input_wav, output_wav, target_gender_balance, target_ag
 
 # --- Configuration ---
 CSV_PATH = "data/filtered_dataset.csv"
-CLIPS_DIR = "data/cv-corpus-23.0-2025-09-05/tr/clips"
+TSV_PATH = "/mnt/data/ai/cv-corpus-23.0-2025-09-05/tr/validated.tsv"
+CLIPS_DIR = "/mnt/data/ai/cv-corpus-23.0-2025-09-05/tr/clips"
 CHECKPOINT_DIR = "checkpoints"
 
 DEVICE = "cpu"
@@ -409,17 +441,17 @@ elif torch.backends.mps.is_available():
     DEVICE = "mps"
 
 SAMPLE_RATE = 16000
-N_EPOCHS = 25
+N_EPOCHS = 100
 
 # Restored Variables
-N_CHECKPOINTS = 100  # Save every 1000 batches
-N_LOG = 10  # Log every 100 batches
-LIMIT = 2  # 0 = Use Full Dataset
-BATCH_SIZE = 4  # Restored variable
+N_CHECKPOINTS = 1000  # Save every 1000 batches
+N_LOG = 100  # Log every 100 batches
+LIMIT = 0  # 0 = Use Full Dataset
+BATCH_SIZE = 16  # Restored variable
 
 # Update this to point to a specific step checkpoint if needed
 CHECKPOINT = f"{CHECKPOINT_DIR}/model_last.pth"
-INPUT_WAV = "/Users/kureta/Music/Random Samples/haiku.mp3"
+INPUT_WAV = "/mnt/Data/Audio/misc/haiku.mp3"
 
 def training():
     # --- Setup ---
@@ -507,4 +539,5 @@ def inference():
 
 
 if __name__ == "__main__":
-    inference()
+    training()
+
