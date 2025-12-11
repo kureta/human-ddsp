@@ -574,7 +574,10 @@ class CsvAudioDataset(Dataset):
 
         # 2. Pick random sample for overfitting
         # We shuffle and take top 'limit'
-        self.data = df.sample(n=limit, with_replacement=False)
+        if limit <= 0:
+            self.data = df
+        else:
+            self.data = df.sample(n=limit, with_replacement=False)
         print(f"Overfitting on these {limit} clips:\n{self.data}")
 
         # 3. Define Mappings
@@ -797,17 +800,20 @@ def encode_age(age_str):
 # --- Test ---
 def main():
     # --- Configuration ---
-    CSV_PATH = "data/filtered_dataset.csv"
-    CLIPS_DIR = "data/cv-corpus-23.0-2025-09-05/tr/clips"
-    # TSV_PATH = "data/cv-corpus-23.0-2025-09-05/tr/validated.tsv"
+    CSV_PATH = "/content/filtered_dataset.csv"
+    CLIPS_DIR = "/content/cv-corpus-23.0-2025-09-05/tr/clips"
+    # TSV_PATH = "/content/cv-corpus-23.0-2025-09-05/tr/validated.tsv"
     DEVICE = "cpu"
     if torch.cuda.is_available():
         DEVICE = "cuda"
     elif torch.backends.mps.is_available():
         DEVICE = torch.device("mps")
     SAMPLE_RATE = 16000
-    N_EPOCHS = 100
-    N_CHECKPOINTS = 10
+    N_EPOCHS = 1000
+    N_CHECKPOINTS = 1000
+    N_LOG = 250
+    LIMIT = 0
+    BATCH_SIZE = 8
 
     # process_tsv(TSV_PATH, CSV_PATH)
 
@@ -815,22 +821,24 @@ def main():
     dataset = CsvAudioDataset(
         csv_path=CSV_PATH,
         clips_root=CLIPS_DIR,
-        limit=4  # Load 4 random files to overfit
+        limit=LIMIT  # Load 4 random files to overfit
     )
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     # --- Model ---
     model = VoiceAutoEncoder(sample_rate=SAMPLE_RATE).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     criterion = MultiScaleSpectralLoss().to(DEVICE)  # Or auraloss
 
-    print("Starting Training...")
+    print(f"Starting Training on {DEVICE}...")
 
+    num_batches = 0
     # --- Loop ---
     for epoch in range(1, N_EPOCHS):
         total_loss = 0.0
 
         for batch in dataloader:
+            num_batches += 1
             # Unpack
             audio, gender, age = batch
             audio = audio.to(DEVICE)
@@ -852,39 +860,153 @@ def main():
 
             total_loss += loss.item()
 
-        # Log
-        if epoch % 1 == 0:
-            print(f"Epoch {epoch} | Loss: {total_loss / len(dataloader):.4f}")
+            # Log
+            if num_batches % N_LOG == 0:
+                print(f"Epoch {epoch} | Loss: {total_loss / len(dataloader):.4f}")
 
-        # Save Random Sample
-        if epoch % N_CHECKPOINTS == 0:
-            os.makedirs("checkpoints", exist_ok=True)
+            # Save Random Sample
+            if num_batches % N_CHECKPOINTS == 0:
+                os.makedirs("/content/checkpoints", exist_ok=True)
 
-            # 1. SAVE MODEL WEIGHTS (This was missing)
-            torch.save(model.state_dict(), f"checkpoints/model_ep{epoch}.pth")
+                # 1. SAVE MODEL WEIGHTS (This was missing)
+                torch.save(model.state_dict(), f"/content/checkpoints/model_ep{epoch}.pth")
 
-            with torch.no_grad():
-                # Pick random index from this batch to save
-                # (Ensures we don't just hear the first file every time)
-                ridx = random.randint(0, audio.shape[0] - 1)
+                with torch.no_grad():
+                    # Pick random index from this batch to save
+                    # (Ensures we don't just hear the first file every time)
+                    ridx = random.randint(0, audio.shape[0] - 1)
 
-                # Get data
-                tgt = audio[ridx].cpu().numpy()
-                out = wet[ridx].cpu().numpy()
+                    # Get data
+                    tgt = audio[ridx].cpu().numpy()
+                    out = wet[ridx].cpu().numpy()
 
-                # Info string for filename
-                g_str = "Fem" if gender[ridx].item() > 0.5 else "Male"
-                a_val = age[ridx].item()
+                    # Info string for filename
+                    g_str = "Fem" if gender[ridx].item() > 0.5 else "Male"
+                    a_val = age[ridx].item()
 
-                # Save
-                fname_base = f"checkpoints/ep{epoch}_{g_str}_Age{a_val:.2f}"
-                scipy.io.wavfile.write(f"{fname_base}_target.wav", SAMPLE_RATE, tgt)
-                scipy.io.wavfile.write(f"{fname_base}_recon.wav", SAMPLE_RATE, out)
+                    # Save
+                    fname_base = f"/content/checkpoints/ep{epoch}_{g_str}_Age{a_val:.2f}"
+                    scipy.io.wavfile.write(f"{fname_base}_target.wav", SAMPLE_RATE, tgt)
+                    scipy.io.wavfile.write(f"{fname_base}_recon.wav", SAMPLE_RATE, out)
 
-            print(f"Saved checkpoint and audio to checkpoints/model_ep{epoch}.pth")
+                print(f"Saved checkpoint and audio to checkpoints/model_ep{epoch}.pth")
 
     print("Done.")
 
 
+def convert_voice(
+        model,
+        input_wav,
+        output_wav,
+        target_gender,
+        target_age,
+        pitch_shift=0.0,
+        device='cpu'
+):
+    """
+    Args:
+        model: Loaded VoiceAutoEncoder
+        input_wav: Path to source audio
+        output_wav: Path to save result
+        target_gender: 0.0 (Male) to 1.0 (Female)
+        target_age: 0.16 (Teen) to 0.85 (Elderly)
+        pitch_shift: Shift in semitones (e.g., 12.0 for up one octave)
+    """
+    # 1. Load and Preprocess Audio
+    audio, sr = torchaudio.load(input_wav)
+
+    # Mix to Mono
+    if audio.shape[0] > 1:
+        audio = torch.mean(audio, dim=0, keepdim=True)
+
+    # Resample to 16k
+    if sr != 16000:
+        resampler = T.Resample(sr, 16000)
+        audio = resampler(audio)
+
+    # Normalize volume
+    peak = torch.abs(audio).max()
+    if peak > 0:
+        audio = audio / peak
+
+    # Add Batch Dimension [1, Time]
+    audio = audio.to(device)
+
+    # 2. Run Inference
+    model.eval()
+    with torch.no_grad():
+        # A. Extract Features
+        f0, loud_db, z = model.encoder(audio)
+
+        # B. Pitch Shift (Modify F0)
+        if pitch_shift != 0:
+            pitch_scale = 2 ** (pitch_shift / 12.0)
+            f0 = f0 * pitch_scale
+
+        # C. Prepare Conditions
+        # Controller expects [Batch] inputs for gender/age
+        g_tensor = torch.tensor([target_gender], device=device).float()
+        a_tensor = torch.tensor([target_age], device=device).float()
+
+        # D. Predict Controls
+        controls = model.controller(f0, loud_db, z, g_tensor, a_tensor)
+
+        # E. Synthesize
+        # We pass target_length to ensure output matches input duration exactly
+        dry_audio = model.decoder(
+            f0=controls['f0'],
+            amplitude=controls['amplitude'],
+            open_quotient=controls['open_quotient'],
+            vocal_tract_curve=controls['vocal_tract_curve'],
+            noise_filter_curve=controls['noise_filter_curve'],
+            target_length=audio.shape[-1]
+        )
+
+        # F. Reverb
+        wet_audio = model.reverb(dry_audio)
+
+    # 3. Save Output
+    # Normalize output to prevent clipping
+    wet_audio = wet_audio.cpu()
+    wet_audio = wet_audio / (torch.abs(wet_audio).max() + 1e-6)
+
+    torchaudio.save(output_wav, wet_audio, 16000)
+    print(f"Saved: {output_wav}")
+
+
+def run_inference_demo():
+    # --- Config ---
+    CHECKPOINT = "/Users/kureta/Downloads/model_ep1.pth"  # Update this
+    INPUT_WAV = "/Users/kureta/Music/Random Samples/haiku.mp3"  # Update this
+    DEVICE = "cpu"
+    if torch.cuda.is_available():
+        DEVICE = "cuda"
+    elif torch.backends.mps.is_available():
+        DEVICE = torch.device("mps")
+
+    # --- Load Model ---
+    print(f"Loading model from {CHECKPOINT}...")
+    model = VoiceAutoEncoder(sample_rate=16000).to(DEVICE)
+    model.load_state_dict(torch.load(CHECKPOINT, map_location=DEVICE))
+
+    # --- 1. Reconstruction (No Change) ---
+    convert_voice(model, INPUT_WAV, "output_recon.wav",
+                  target_gender=0.0, target_age=0.30, pitch_shift=0.0, device=DEVICE)
+
+    # --- 2. Gender Swap (Male -> Female) ---
+    # Shift pitch up slightly (common for gender swap) + Female Gender Token
+    convert_voice(model, INPUT_WAV, "output_female.wav",
+                  target_gender=1.5, target_age=0.10, pitch_shift=12.0, device=DEVICE)
+
+    # --- 3. Age Aging (Young -> Old) ---
+    # Make voice deeper and older
+    convert_voice(model, INPUT_WAV, "output_old_male.wav",
+                  target_gender=0.0, target_age=0.95, pitch_shift=-2.0, device=DEVICE)
+
+    # --- 4. Chipmunk Effect ---
+    convert_voice(model, INPUT_WAV, "output_chipmunk.wav",
+                  target_gender=0.5, target_age=0.07, pitch_shift=7.0, device=DEVICE)
+
+
 if __name__ == "__main__":
-    main()
+    run_inference_demo()
