@@ -1,8 +1,15 @@
+import os
+
 import numpy as np
+import polars as pl
 import scipy.io.wavfile
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
+import torchaudio
+import torchaudio.transforms as T
+from torch.utils.data import Dataset, DataLoader
 
 
 def rosenberg_pulse_soft(phase, open_quotient=0.6, hardness=200.0):
@@ -42,351 +49,734 @@ def rosenberg_pulse_soft(phase, open_quotient=0.6, hardness=200.0):
     return out
 
 
-class DifferentiableFormantSynthesizer(nn.Module):
-    def __init__(self, sample_rate=44100, n_fft=1024, hop_length=256):
-        super().__init__()
-        self.sample_rate = sample_rate
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.window = torch.hann_window(n_fft)
-
-        # Pre-compute frequency bins for the filter response calculation
-        # Shape: [1, 1, n_fft // 2 + 1] to broadcast over batch and time
-        freqs = torch.linspace(0, sample_rate / 2, n_fft // 2 + 1)
-        self.register_buffer('freq_bins', freqs.view(1, 1, -1))
-
-    def generate_source(self, f0, voiced_amp, noise_amp):
-        """
-        Generates the raw excitation signal: a mix of Sawtooth (Glottal) and Noise.
-        We assume inputs are upsampled to audio-rate or linear interpolated.
-        """
-        # 1. Harmonic Source (Approximated Glottal Pulse)
-        # Integrate frequency to get phase: phi[t] = phi[t-1] + 2*pi*f0[t]/sr
-        phase = torch.cumsum(f0 / self.sample_rate, dim=-1)
-
-        # Using Rosenberg Pulse
-        glottal_wave = rosenberg_pulse_soft(phase)
-        # A simple difference filter to simulate radiation at the lips:
-        glottal_wave_diff = glottal_wave[..., 1:] - glottal_wave[..., :-1]
-        # Pad back to original length
-        glottal_wave = F.pad(glottal_wave_diff, (1, 0))
-        glottal_wave -= glottal_wave.mean(dim=-1, keepdim=True)
-
-        # Only allow noise when the glottis is OPEN
-        noise_envelope = glottal_wave.clamp(min=0)
-        noise_envelope /= noise_envelope.abs().max()
-        pulsed_noise = torch.randn_like(glottal_wave) * noise_envelope
-
-        # 3. Mix
-        # voiced_amp and noise_amp should control the mix
-        source = (glottal_wave * voiced_amp) + (pulsed_noise * noise_amp)
-        return source
-
-    def get_formant_response(self, center_freqs, bandwidths):
-        """
-        Calculates the frequency response of the vocal tract.
-        Modeled as a cascade (product) of 2-pole resonators.
-
-        center_freqs: [batch, frames, num_formants]
-        bandwidths:   [batch, frames, num_formants]
-        """
-        # Expand freq_bins to match input shape: [batch, frames, n_bins]
-        f = self.freq_bins  # [1, 1, n_bins]
-
-        # Expand formants to broadcast against freq bins
-        # fc shape: [batch, frames, num_formants, 1]
-        fc = center_freqs.unsqueeze(-1)
-        bw = bandwidths.unsqueeze(-1)
-
-        # The resonant filter curve equation (squared magnitude of a 2-pole system):
-        # H(f) = 1 / sqrt( (f^2 - fc^2)^2 + (f * bw)^2 )
-        # We add a small epsilon to avoid division by zero
-        denominator = torch.sqrt((f ** 2 - fc ** 2) ** 2 + (f * bw) ** 2 + 1e-8)
-
-        # Response for each formant
-        response_per_formant = 1.0 / denominator
-
-        # Normalize to keep unity gain at resonance peak approx
-        # (This is optional but helps stability)
-        peak_gain = 1.0 / (fc * bw + 1e-8)
-        response_per_formant = response_per_formant / peak_gain
-
-        # Cascade: Multiply the responses of all formants together
-        # Shape result: [batch, frames, n_bins]
-        total_response = torch.prod(response_per_formant, dim=2)
-
-        return total_response
-
-    def forward(self, f0, voiced_amp, noise_amp, formant_freqs, formant_bws):
-        """
-        f0: [batch, time_steps] (Audio rate or upsampled before passing)
-        voiced_amp: [batch, time_steps]
-        noise_amp: [batch, time_steps]
-        formant_freqs: [batch, n_frames, n_formants] (Control rate, e.g., 1 per 10ms)
-        formant_bws:   [batch, n_frames, n_formants]
-        """
-        batch_size, n_samples = f0.shape
-
-        # 1. Generate Source Signal (Time Domain)
-        excitation = self.generate_source(f0, voiced_amp, noise_amp)
-
-        # 2. Move Source to Frequency Domain (STFT)
-        # We pad to center the STFT windows
-        excitation_stft = torch.stft(excitation, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.n_fft,
-                                     window=self.window.to(excitation.device), return_complex=True, center=True)
-        # excitation_stft shape: [batch, freq_bins, n_frames]
-        # We need to transpose to [batch, n_frames, freq_bins] to match our filter
-        excitation_stft = excitation_stft.transpose(1, 2)
-
-        # 3. Construct Filter (Frequency Domain)
-        # We assume formant inputs are already at the correct 'frame' resolution matching the STFT.
-        # If not, you would interpolate `formant_freqs` here to match excitation_stft.shape[1].
-        filter_response = self.get_formant_response(formant_freqs, formant_bws)
-
-        # Cast filter to complex for multiplication
-        # filter_response_c = filter_response.unsqueeze(-1)  # make it [..., 1] for complex broadcasting if needed
-        # or just multiply by magnitude if phase is zero
-        # Since we are modeling magnitude response only (zero phase filter),
-        # we just multiply the complex STFT by the real magnitude curve.
-
-        output_stft = excitation_stft * filter_response.type_as(excitation_stft)
-
-        # 4. Inverse STFT to get Time Domain Audio
-        # Transpose back
-        output_stft = output_stft.transpose(1, 2)
-
-        output_audio = torch.istft(output_stft, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.n_fft,
-                                   window=self.window.to(excitation.device), length=n_samples)
-
-        return output_audio
-
-
 class NeuralVoiceDecoder(nn.Module):
-    def __init__(self, sample_rate=44100, n_fft=1024, hop_length=256, n_filter_bins=65):
+    def __init__(self, sample_rate=16000, n_fft=1024, hop_length=256, n_filter_bins=65):
         super().__init__()
         self.sample_rate = sample_rate
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.n_filter_bins = n_filter_bins
-
-        # Window for STFT operations
         self.register_buffer('window', torch.hann_window(n_fft))
 
     def rosenberg_source(self, f0, open_quotient):
-        """
-        Generates the Glottal Pulse excitation.
-        """
-        # 1. Integrate Phase
+        # f0 and OQ are now Audio Rate [Batch, Time]
         phase = torch.cumsum(f0 / self.sample_rate, dim=-1)
         p = phase - torch.floor(phase)
 
-        # 2. Glottal Pulse Shape (Rosenberg C)
-        # Avoid div/0 and keep OQ in reasonable range
         oq = torch.clamp(open_quotient, 0.1, 0.9)
-
-        # The Pulse
         scaled_phase = p / (oq + 1e-8)
-        pulse = 0.5 * (1.0 - torch.cos(np.pi * scaled_phase))
 
-        # Soft Masking (differentiable gating)
+        pulse = 0.5 * (1.0 - torch.cos(np.pi * scaled_phase))
         mask = torch.sigmoid((oq - p) * 100.0)
         glottal_wave = pulse * mask
 
-        # 3. Spectral Tilt (Differentiation)
-        # Simulates lip radiation
         diff_wave = glottal_wave[..., 1:] - glottal_wave[..., :-1]
         return F.pad(diff_wave, (1, 0))
 
     def apply_filter(self, excitation, filter_magnitudes):
-        """
-        Applies a time-varying spectral envelope to the excitation.
-        Uses Frequency Sampling (STFT Multiplication).
+        # excitation: [Batch, Time]
+        # filter_magnitudes: [Batch, Frames, Bins]
 
-        excitation: [Batch, Time]
-        filter_magnitudes: [Batch, Frames, n_filter_bins]
-                           (NN outputs these curves)
-        """
-        # 1. STFT of Excitation
-        ex_stft = torch.stft(excitation, self.n_fft, self.hop_length, win_length=self.n_fft, window=self.window,
-                             center=True, return_complex=True)
-        # Shape: [Batch, Freqs, Frames]
+        # 1. STFT
+        ex_stft = torch.stft(
+            excitation,
+            self.n_fft,
+            self.hop_length,
+            win_length=self.n_fft,
+            window=self.window,
+            center=True,
+            return_complex=True
+        )
 
-        # 2. Interpolate Filter Curves to Match STFT
-        # The NN might output 65 bins, but STFT has n_fft/2+1 (e.g. 513) bins.
-        # We assume filter_magnitudes is sampled linearly or mel-scale.
-        # Here we assume linear for simplicity.
-
-        # Transpose to [Batch, n_bins, Frames] for interpolation
+        # 2. Interpolate Filter to match STFT Frames
+        # [Batch, Frames, Bins] -> [Batch, Bins, Frames]
         filter_mod = filter_magnitudes.transpose(1, 2)
 
-        # Resize to match STFT frequency bins
+        # Resize Time axis to match STFT
+        filter_resized = F.interpolate(
+            filter_mod,
+            size=ex_stft.shape[2],
+            mode='linear', align_corners=False
+        )
+
+        # Resize Freq axis to match STFT Bins
         target_bins = ex_stft.shape[1]
-        filter_resized = F.interpolate(filter_mod, size=ex_stft.shape[2],  # Match Time Frames
-                                       mode='linear', align_corners=False)
+        filter_final = F.interpolate(
+            filter_resized.transpose(1, 2),  # [B, T, Bins]
+            size=target_bins,
+            mode='linear', align_corners=False
+        ).transpose(1, 2)  # [B, Bins, T]
 
-        # Now resize Frequency axis (if NN output != STFT bins)
-        # Usually NN outputs fewer bands (e.g. 65) than FFT (513).
-        # We need to stretch the 65 bands to cover the spectrum.
-        filter_final = F.interpolate(filter_resized.transpose(1, 2),  # Back to [Batch, Frames, Bins]
-                                     size=target_bins, mode='linear', align_corners=False).transpose(1,
-                                                                                                     2)  # [Batch, Bins, Frames]
-
-        # 3. Apply Filter (Complex Multiplication)
-        # We filter the magnitudes, preserving the phase of the source
+        # 3. Filter
         output_stft = ex_stft * filter_final.type_as(ex_stft)
 
         # 4. iSTFT
-        output_audio = torch.istft(output_stft, self.n_fft, self.hop_length, win_length=self.n_fft, window=self.window,
-                                   length=excitation.shape[-1])
+        output_audio = torch.istft(
+            output_stft,
+            self.n_fft,
+            self.hop_length,
+            win_length=self.n_fft,
+            window=self.window,
+            length=excitation.shape[-1]
+        )
         return output_audio
 
-    def forward(self, f0, amplitude, open_quotient, vocal_tract_curve, noise_filter_curve):
+    def forward(self, f0, amplitude, open_quotient, vocal_tract_curve, noise_filter_curve, target_length=None):
         """
-        Full DSP Pass.
-
-        f0: [B, T]
-        amplitude: [B, T] (Global volume)
-        open_quotient: [B, T] (Breathiness control)
-        vocal_tract_curve: [B, Frames, n_bins] (The Vowel/Formants)
-        noise_filter_curve: [B, Frames, n_bins] (The Consonant/Fricative shape)
+        f0, amplitude, open_quotient: [Batch, Frames, 1] (Control Rate)
+        target_length: int (Desired Audio Samples)
         """
+        # Determine Output Length
+        if target_length is None:
+            # Fallback: estimate based on frames
+            target_length = f0.shape[1] * self.hop_length
 
-        # 1. Generate Harmonic Source (Glottis)
-        # Upsample controls to audio rate if necessary
-        # (Assuming f0/amp/oq are already audio-rate [B, T] for this snippet)
-        glottal_source = self.rosenberg_source(f0, open_quotient)
+        # --- UPSAMPLING (Fixes the error) ---
+        def upsample(x):
+            # Input: [Batch, Frames, 1]
+            x = x.transpose(1, 2)  # [Batch, 1, Frames]
+            x = F.interpolate(x, size=target_length, mode='linear', align_corners=False)
+            return x.squeeze(1)  # [Batch, Time]
 
-        # 2. Generate Noise Source
+        # Convert Controls to Audio Rate
+        f0_up = upsample(f0)
+        amp_up = upsample(amplitude)
+        oq_up = upsample(open_quotient)
+
+        # 1. Source
+        glottal_source = self.rosenberg_source(f0_up, oq_up)
         noise_source = torch.randn_like(glottal_source)
 
-        # OPTIONAL: Pulsed Noise (Modulate noise by glottis for realism)
-        # noise_source = noise_source * torch.relu(glottal_source)
-
-        # 3. Apply Vocal Tract Filter to Glottal Source
-        # (The NN gives us the frequency curve for the current vowel)
+        # 2. Filter (Decoder handles Frame->STFT interpolation internally)
         voiced_part = self.apply_filter(glottal_source, vocal_tract_curve)
-
-        # 4. Apply Noise Filter to Noise Source
-        # (The NN gives us the frequency curve for fricatives like "sh", "s")
         unvoiced_part = self.apply_filter(noise_source, noise_filter_curve)
 
-        # 5. Mix and Scale
-        # In this architecture, vocal_tract_curve handles the gain of the voice,
-        # and noise_filter_curve handles the gain of the noise.
-        # 'amplitude' is a global scaler.
-
-        mix = (voiced_part + unvoiced_part) * amplitude
+        # 3. Mix
+        mix = (voiced_part + unvoiced_part) * amp_up
 
         return mix
 
 
-def generate_spectral_curve(n_bins, peaks):
-    """
-    Helper to draw a spectral envelope (Magnitude Response).
-    Mimics what a Neural Network decoder would output.
-
-    n_bins: Number of freq bins (e.g., 65)
-    peaks: List of tuples [(freq_norm, amplitude, bandwidth_norm), ...]
-           freq_norm: 0.0 to 1.0 (Nyquist)
-    """
-    x = torch.linspace(0, 1, n_bins)
-    curve = torch.zeros(n_bins)
-
-    for f, amp, bw in peaks:
-        # Gaussian curve for each formant/resonance
-        # exp( - (x - f)^2 / (2 * bw^2) )
-        blob = torch.exp(-0.5 * ((x - f) / bw) ** 2)
-        curve += blob * amp
-
-    return curve
+def _create_a_weighting(n_fft, sr):
+    """Creates the A-weighting curve for Perceptual Loudness."""
+    freqs = torch.linspace(0, sr / 2, n_fft // 2 + 1)
+    # Standard A-weighting equation
+    f_sq = freqs ** 2
+    term1 = 12194.217 ** 2 * f_sq ** 2
+    term2 = (f_sq + 20.6 ** 2) * (f_sq + 107.7 ** 2) * \
+            (f_sq + 737.9 ** 2) * (f_sq + 12194.217 ** 2) ** 0.5
+    gain = term1 / (term2 + 1e-8)
+    return gain
 
 
-# --- Reuse Helper Functions ---
-# (Assuming NeuralVoiceDecoder and generate_spectral_curve are defined/imported)
+class AudioFeatureEncoder(nn.Module):
+    def __init__(self,
+                 sample_rate=16000,
+                 n_fft=1024,
+                 hop_length=256,
+                 n_mels=80,
+                 z_dim=128,
+                 gru_units=512,
+                 gru_layers=2,
+                 ):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.hop_length = hop_length
+        self.n_fft = n_fft
 
-def get_params_ah_ee(sr=44100):
-    duration = 1.0
-    n_samples = int(sr * duration)
-    hop = 256
-    n_frames = n_samples // hop + 1
-    n_bins = 65
+        # --- 1. Loudness Tools ---
+        self.spectrogram = T.Spectrogram(n_fft=n_fft, hop_length=hop_length, power=2.0)
+        self.register_buffer('a_weighting', _create_a_weighting(n_fft, sample_rate))
 
-    # 1. Global Controls
-    t = torch.linspace(0, duration, n_samples).unsqueeze(0)
+        # --- 2. Real-Time Timbre Encoder ---
+        self.melspec = T.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            n_mels=n_mels
+        )
+        self.norm = nn.InstanceNorm1d(n_mels)
+        self.rnn = nn.GRU(n_mels, gru_units, gru_layers, batch_first=True, bidirectional=False)
+        self.projection = nn.Linear(gru_units, z_dim)
 
-    # Pitch: Slight vibrato around 130Hz
-    f0 = torch.linspace(130, 110, n_samples).unsqueeze(0)
-    f0 = f0 + 2.0 * torch.sin(2 * np.pi * 5.0 * t)
-    f0 = f0 + 130 * 0.1 * torch.randn_like(t)
+    def get_pitch(self, audio):
+        """
+        Pure PyTorch Pitch Detector using Autocorrelation (ACF).
+        Differentiable and dependency-free.
+        """
+        # 1. Frame the audio [Batch, Frames, Window]
+        # Use Unfold to create sliding windows matching STFT logic
+        # Pad audio to match STFT centering if possible, or just standard framing
+        pad = self.n_fft // 2
+        audio_pad = F.pad(audio.unsqueeze(1), (pad, pad), mode='reflect').squeeze(1)
 
-    # Amp: Fade in/out
-    amp_env = torch.clamp(torch.sin(np.pi * t / duration), min=0.0) ** 0.5
+        # Unfold: [Batch, Window_Size, Frames]
+        frames = audio_pad.unfold(dimension=-1, size=self.n_fft, step=self.hop_length)
 
-    # Open Quotient: 0.5 (Normal Tense Voice)
-    oq_traj = torch.ones(1, n_samples) * 0.5
+        # 2. Compute Autocorrelation via FFT
+        # R(t) = iFFT( |FFT(x)|^2 )
+        # FFT size should be >= 2*window to avoid circular convolution aliasing,
+        # but for pitch estimation, standard size often suffices if we ignore edge effects.
+        # We'll use 2*n_fft for cleaner correlation.
+        n_fft_corr = 2 * self.n_fft
+        spec = torch.fft.rfft(frames, n=n_fft_corr, dim=-1)
+        power_spec = spec.abs().pow(2)
+        autocorr = torch.fft.irfft(power_spec, n=n_fft_corr, dim=-1)
 
-    # --- 2. Define Spectral Shapes (The Vowels) ---
+        # We only care about the first half (lags 0 to window size)
+        autocorr = autocorr[..., :self.n_fft]
 
-    # "Ah" (Father): High F1, Low F2
-    # F1~750Hz (0.034 norm), F2~1100Hz (0.05 norm)
-    vt_ah = generate_spectral_curve(n_bins, [
-        (0.034, 1.0, 0.02),  # F1 (Strong)
-        (0.050, 0.8, 0.02),  # F2 (Close to F1)
-        (0.120, 0.4, 0.03)  # F3 (Static high ring)
-    ])
+        # 3. Peak Picking
+        # We normalize by lag 0 to get NCCF (Normalized Cross Correlation) roughly
+        # This helps ignore amplitude variations.
+        norm_factor = autocorr[..., 0:1] + 1e-8
+        norm_autocorr = autocorr / norm_factor
 
-    # "Ee" (Beet): Low F1, High F2
-    # F1~300Hz (0.013 norm), F2~2200Hz (0.10 norm)
-    vt_ee = generate_spectral_curve(n_bins, [
-        (0.013, 1.0, 0.01),  # F1 (Boomy/Low)
-        (0.100, 0.9, 0.02),  # F2 (Very High/Bright)
-        (0.130, 0.5, 0.03)  # F3
-    ])
+        # Define Pitch Search Range (e.g., 50Hz to 1000Hz)
+        min_f0 = 50
+        max_f0 = 1000
 
-    # --- 3. Interpolate (Morph) ---
+        # Convert Hz to Lag indices
+        # lag = sr / freq
+        min_lag = int(self.sample_rate / max_f0)
+        max_lag = int(self.sample_rate / min_f0)
 
-    vt_traj = torch.zeros(1, n_frames, n_bins)
-    nf_traj = torch.zeros(1, n_frames, n_bins)  # Stays zero
+        # Restrict search area
+        # We slice the autocorrelation buffer to the valid lags
+        search_region = norm_autocorr[..., min_lag:max_lag]
 
-    # Morph over the middle 50% of the clip
-    for i in range(n_frames):
-        pos = i / n_frames
+        # Find the index of the max correlation in the search region
+        max_val, max_idx = torch.max(search_region, dim=-1)
 
-        # Simple Linear Interpolation (Morphing)
-        # 0.0-0.2: Hold Ah
-        # 0.2-0.8: Morph Ah->Ee
-        # 0.8-1.0: Hold Ee
+        # Correct the index offset
+        true_lag = max_idx + min_lag
 
-        if pos < 0.2:
-            ratio = 0.0
-        elif pos > 0.8:
-            ratio = 1.0
+        # Convert Lag -> Frequency
+        # f0 = sr / lag
+        f0 = self.sample_rate / (true_lag.float() + 1e-8)
+
+        # 4. Unvoiced Detection (Thresholding)
+        # If correlation is weak (< 0.3), treat as unvoiced (0 Hz)
+        # max_val is the correlation coefficient (0.0 to 1.0)
+        unvoiced_mask = (max_val < 0.3)
+        f0[unvoiced_mask] = 0.0
+
+        return f0.unsqueeze(-1)  # [Batch, Frames, 1]
+
+    def get_loudness(self, audio):
+        spec = self.spectrogram(audio) + 1e-8
+        weighted_spec = spec * self.a_weighting.view(1, -1, 1)
+        mean_power = torch.mean(weighted_spec, dim=1, keepdim=True)
+        loudness_db = 10 * torch.log10(mean_power)
+        return loudness_db.transpose(1, 2)
+
+    def encode_timbre(self, audio):
+        mels = self.melspec(audio)
+        mels = torch.log(mels + 1e-5)
+        mels = self.norm(mels)
+
+        mels = mels.transpose(1, 2)
+        rnn_out, _ = self.rnn(mels)
+
+        z = self.projection(rnn_out)
+        return z
+
+    def forward(self, audio):
+        f0 = self.get_pitch(audio)
+        loudness = self.get_loudness(audio)
+        z = self.encode_timbre(audio)
+
+        # Align lengths (Autocorrelation framing vs STFT framing)
+        min_len = min(f0.shape[1], loudness.shape[1], z.shape[1])
+        return f0[:, :min_len, :], loudness[:, :min_len, :], z[:, :min_len, :]
+
+
+class LearnableReverb(nn.Module):
+    def __init__(self, sample_rate=16000, reverb_duration=1.0):
+        super().__init__()
+        self.sample_rate = sample_rate
+
+        # Length of the impulse response in samples
+        n_samples = int(sample_rate * reverb_duration)
+
+        # 1. Initialize with a realistic "decaying noise" shape
+        # This acts as a good prior so the model starts with a "room" sound
+        decay = torch.exp(-torch.linspace(0, 5, n_samples))  # Decays to ~0.006 over duration
+        noise = torch.randn(n_samples) * 0.1
+        initial_ir = noise * decay
+
+        # 2. Register as a Trainable Parameter
+        # Shape: [1, 1, Time] to broadcast over batch
+        self.impulse_response = nn.Parameter(initial_ir.view(1, 1, -1))
+
+    def forward(self, audio):
+        """
+        Convolves the input audio with the learned Impulse Response.
+        Args:
+            audio: [Batch, Time] (Dry Signal)
+        Returns:
+            wet_audio: [Batch, Time] (Reverberated Signal)
+        """
+        # Ensure input has channel dim [Batch, 1, Time] for consistency,
+        # though we'll squeeze it later.
+        if audio.dim() == 2:
+            x = audio.unsqueeze(1)
         else:
-            ratio = (pos - 0.2) / 0.6
+            x = audio
 
-        # Linear mix of the spectral vectors
-        # This simulates the NN traversing the latent space
-        current_shape = vt_ah * (1 - ratio) + vt_ee * ratio
-        vt_traj[0, i] = current_shape
+        # Get dimensions
+        batch, channels, dry_len = x.shape
+        ir_len = self.impulse_response.shape[-1]
 
-    return f0, amp_env, oq_traj, vt_traj, nf_traj
+        # --- FFT Convolution ---
+        # We must pad to (dry_len + ir_len - 1) to avoid circular aliasing
+        fft_size = dry_len + ir_len - 1
+
+        # Next power of 2 is faster for FFT
+        import math
+        n_fft = 2 ** math.ceil(math.log2(fft_size))
+
+        # 1. FFT
+        dry_fft = torch.fft.rfft(x, n=n_fft, dim=-1)
+        ir_fft = torch.fft.rfft(self.impulse_response, n=n_fft, dim=-1)
+
+        # 2. Multiply (Convolution in time = Multiplication in Freq)
+        wet_fft = dry_fft * ir_fft
+
+        # 3. iFFT
+        wet_audio = torch.fft.irfft(wet_fft, n=n_fft, dim=-1)
+
+        # 4. Crop
+        # Convolution makes the signal longer (tail).
+        # For training, we usually crop back to the input length
+        # so the loss function compares aligned sizes.
+        return wet_audio.squeeze(1)[..., :dry_len]
 
 
-def run_ah_ee_neural():
-    sr = 44100
-    decoder = NeuralVoiceDecoder(sample_rate=sr, n_filter_bins=65)
-    f0, amp, oq, vt, nf = get_params_ah_ee(sr)
+class VoiceController(nn.Module):
+    def __init__(self,
+                 z_dim=128,
+                 n_filter_bins=65,
+                 hidden_dim=512,
+                 n_layers=3):
+        super().__init__()
+        self.n_filter_bins = n_filter_bins
 
-    with torch.no_grad():
-        audio = decoder(f0, amp, oq, vt, nf)
+        # 1. Input Preprocessing
+        # We concatenate z (128) + f0 (1) + loudness (1)
+        input_dim = z_dim + 1 + 1
 
-    wav = audio.squeeze().cpu().numpy()
-    if np.max(np.abs(wav)) > 0:
-        wav = wav / np.max(np.abs(wav))
+        # 2. The Main "Brain" (MLP)
+        # Using GRU here is optional.
+        # Since the Encoder handled the time-context, an MLP is often enough
+        # and has zero latency for the decoding step.
+        layers = []
+        for i in range(n_layers):
+            in_d = input_dim if i == 0 else hidden_dim
+            layers.append(nn.Linear(in_d, hidden_dim))
+            layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.LeakyReLU(0.1))
 
-    scipy.io.wavfile.write("ddsp_ah_ee.wav", sr, wav.astype(np.float32))
-    print("Saved 'ddsp_ah_ee.wav'. Check the smooth spectral morph.")
+        self.mlp = nn.Sequential(*layers)
+
+        # 3. Output Projections (The "Knobs")
+
+        # A. Open Quotient (Breathiness) -> Scalar (0.0 to 1.0)
+        self.proj_oq = nn.Linear(hidden_dim, 1)
+
+        # B. Vocal Tract Curve (Vowels) -> 65 frequency bins (0.0 to 1.0)
+        self.proj_vt = nn.Linear(hidden_dim, n_filter_bins)
+
+        # C. Noise Filter Curve (Consonants) -> 65 frequency bins (0.0 to 1.0)
+        self.proj_nf = nn.Linear(hidden_dim, n_filter_bins)
+
+    def forward(self, f0, loudness_db, z):
+        """
+        Args:
+            f0: [Batch, Frames, 1] (Hz)
+            loudness_db: [Batch, Frames, 1] (dB)
+            z: [Batch, Frames, z_dim]
+
+        Returns:
+            Dictionary of controls, ready for NeuralVoiceDecoder
+        """
+        # 1. Normalize Physical Inputs for the Neural Net
+        # Neural Nets hate raw Hz (100-1000) and dB (-100 to 0).
+        # We scale them roughly to [0, 1] or [-1, 1] range.
+
+        # Log-scale F0 is better for pitch perception
+        # map 50Hz..1000Hz -> approx 0..1
+        f0_norm = (torch.log(f0 + 1e-5) - 4.0) / 4.0
+
+        # Loudness: map -100dB..0dB -> 0..1
+        loudness_norm = (loudness_db / 100.0) + 1.0
+        loudness_norm = torch.clamp(loudness_norm, 0.0, 1.0)
+
+        # Concatenate: [Batch, Frames, z_dim + 2]
+        decoder_input = torch.cat([z, f0_norm, loudness_norm], dim=-1)
+
+        # 2. Pass through MLP
+        hidden = self.mlp(decoder_input)
+
+        # 3. Project to Controls
+
+        # Open Quotient: Sigmoid (0 to 1)
+        # Bias the initialization so it starts near 0.5 (normal voice)
+        oq = torch.sigmoid(self.proj_oq(hidden))
+
+        # Vocal Tract (The Formants)
+        # Modified Sigmoid allows it to be perfectly zero if needed
+        # We want smooth curves.
+        vt_curve = torch.sigmoid(self.proj_vt(hidden))
+
+        # Noise Filter (The Hiss)
+        # Usually mostly zero, so standard sigmoid is fine
+        nf_curve = torch.sigmoid(self.proj_nf(hidden))
+
+        # 4. Convert Loudness dB to Linear Amplitude for the Synth
+        # amp = 10 ^ (db / 20)
+        amplitude_linear = torch.pow(10.0, loudness_db / 20.0)
+
+        # Return everything needed by NeuralVoiceDecoder
+        return {
+            "f0": f0,  # Pass through raw F0
+            "amplitude": amplitude_linear,  # Pass through linear amp
+            "open_quotient": oq,
+            "vocal_tract_curve": vt_curve,
+            "noise_filter_curve": nf_curve
+        }
+
+
+class VoiceAutoEncoder(nn.Module):
+    def __init__(self, sample_rate=16000):
+        super().__init__()
+        self.encoder = AudioFeatureEncoder(sample_rate=sample_rate)
+        self.controller = VoiceController(z_dim=128, n_filter_bins=65)
+        self.decoder = NeuralVoiceDecoder(sample_rate=sample_rate, n_filter_bins=65)
+        self.reverb = LearnableReverb(sample_rate=sample_rate, reverb_duration=0.5)
+
+    def forward(self, audio):
+        # 1. Features
+        f0, loud_db, z = self.encoder(audio)
+
+        # 2. Controls
+        controls = self.controller(f0, loud_db, z)
+
+        # 3. Synthesis
+        # PASS THE TARGET LENGTH HERE
+        dry_audio = self.decoder(
+            f0=controls['f0'],
+            amplitude=controls['amplitude'],
+            open_quotient=controls['open_quotient'],
+            vocal_tract_curve=controls['vocal_tract_curve'],
+            noise_filter_curve=controls['noise_filter_curve'],
+            target_length=audio.shape[-1]  # <--- Fix
+        )
+
+        # 4. Reverb
+        wet_audio = self.reverb(dry_audio)
+
+        return wet_audio, dry_audio, controls
+
+
+class MultiScaleSpectralLoss(nn.Module):
+    def __init__(self,
+                 fft_sizes=None,
+                 overlap_ratio=0.75,
+                 mag_weight=1.0,
+                 log_mag_weight=1.0):
+        super().__init__()
+        if fft_sizes is None:
+            fft_sizes = [2048, 1024, 512, 256, 128, 64]
+        self.fft_sizes = fft_sizes
+        self.overlap_ratio = overlap_ratio
+        self.mag_weight = mag_weight
+        self.log_mag_weight = log_mag_weight
+
+    def spectrogram(self, x, n_fft):
+        # Calculate hop length based on overlap
+        hop_length = int(n_fft * (1 - self.overlap_ratio))
+
+        # Apply Hann Window
+        window = torch.hann_window(n_fft).to(x.device)
+
+        # STFT
+        # Input x: [Batch, Time]
+        x_stft = torch.stft(x,
+                            n_fft=n_fft,
+                            hop_length=hop_length,
+                            win_length=n_fft,
+                            window=window,
+                            return_complex=True,
+                            center=True)
+
+        # Magnitude (ignore phase)
+        mag = torch.abs(x_stft)
+
+        # Add small epsilon for log stability
+        mag = torch.clamp(mag, min=1e-7)
+        return mag
+
+    def forward(self, x_pred, x_target):
+        """
+        Calculate loss between predicted and target audio.
+        x_pred: [Batch, Time]
+        x_target: [Batch, Time]
+        """
+        loss = 0.0
+
+        for n_fft in self.fft_sizes:
+            mag_pred = self.spectrogram(x_pred, n_fft)
+            mag_target = self.spectrogram(x_target, n_fft)
+
+            # 1. Linear Magnitude Loss (L1)
+            # Good for high energy components (Formants, Fundamental)
+            lin_loss = F.l1_loss(mag_pred, mag_target)
+
+            # 2. Log Magnitude Loss (L1)
+            # Good for low energy components (High freq noise, reverb tails)
+            # We compress dynamic range so quiet sounds matter too
+            log_loss = F.l1_loss(torch.log(mag_pred), torch.log(mag_target))
+
+            # Combine
+            loss += (self.mag_weight * lin_loss) + (self.log_mag_weight * log_loss)
+
+        return loss
+
+
+# --- Assume you save your model classes in 'model.py' ---
+# from model import VoiceAutoEncoder, MultiScaleSpectralLoss
+# For this script to be standalone, I assume the classes exist in the namespace.
+# (Paste the VoiceAutoEncoder and MultiScaleSpectralLoss classes here if running as one file)
+
+# ==========================================
+# 1. The Dataset (Chunker)
+# ==========================================
+class SingleAudioDataset(Dataset):
+    def __init__(self, audio_path, sample_rate=16000, chunk_size=32000, overlap=0.5):
+        """
+        Loads one file and creates a dataset of overlapping chunks.
+        chunk_size: 32000 samples = 2.0 seconds @ 16kHz
+        overlap: 0.5 = 50% overlap between chunks
+        """
+        super().__init__()
+        self.chunk_size = chunk_size
+
+        # 1. Load Audio
+        # Load and mix to mono
+        audio, sr = torchaudio.load(audio_path)
+        if audio.shape[0] > 1:
+            audio = torch.mean(audio, dim=0, keepdim=True)
+
+        # 2. Resample if necessary
+        if sr != sample_rate:
+            resampler = torchaudio.transforms.Resample(sr, sample_rate)
+            audio = resampler(audio)
+
+        # 3. Normalize (-1.0 to 1.0)
+        max_val = torch.abs(audio).max()
+        if max_val > 0:
+            audio = audio / max_val
+
+        self.data = audio.squeeze()  # [Total_Samples]
+
+        # 4. Create Slice Indices
+        self.starts = []
+        stride = int(chunk_size * (1 - overlap))
+        total_len = self.data.shape[0]
+
+        # Generate start points
+        for i in range(0, total_len - chunk_size + 1, stride):
+            self.starts.append(i)
+
+        print(f"Dataset created: {len(self.starts)} chunks from {total_len / sample_rate:.2f}s of audio.")
+
+    def __len__(self):
+        return len(self.starts)
+
+    def __getitem__(self, idx):
+        start = self.starts[idx]
+        end = start + self.chunk_size
+        return self.data[start:end]
+
+
+# ==========================================
+# 2. The Training Loop
+# ==========================================
+def train_overfit(wav_path, epochs=1000, batch_size=8, lr=1e-4, save_interval=50):
+    # --- Setup ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Training on: {device}")
+
+    # 1. Prepare Data
+    # 2 seconds (32000 samples) is a standard DDSP training window
+    dataset = SingleAudioDataset(wav_path, sample_rate=16000, chunk_size=32000)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+
+    # 2. Init Model
+    model = VoiceAutoEncoder(sample_rate=16000).to(device)
+
+    # 3. Init Loss & Optimizer
+    # We define the loss locally if not imported
+    criterion = MultiScaleSpectralLoss().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # Output dir
+    os.makedirs("checkpoints", exist_ok=True)
+
+    # --- Loop ---
+    model.train()
+
+    for epoch in range(1, epochs + 1):
+        total_loss = 0.0
+
+        for batch_idx, audio_target in enumerate(dataloader):
+            audio_target = audio_target.to(device)
+
+            # Zero grad
+            optimizer.zero_grad()
+
+            # Forward
+            # wet: The final output (with reverb)
+            # dry: The raw synth output
+            # controls: The physical params (f0, loudness, etc.)
+            wet_pred, dry_pred, controls = model(audio_target)
+
+            # Loss
+            # We compare the WET prediction to the original target
+            loss = criterion(wet_pred, audio_target)
+
+            # Backward
+            loss.backward()
+
+            # Gradient Clipping (Important for RNNs/Synths to prevent explosions)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(dataloader)
+        print(f"Epoch [{epoch}/{epochs}] Loss: {avg_loss:.4f}")
+
+        # --- Checkpointing & Inspection ---
+        if epoch % save_interval == 0:
+            # Save Model
+            torch.save(model.state_dict(), f"checkpoints/model_ep{epoch}.pth")
+
+            # Save Audio Sample (Reconstruction of the first item in the last batch)
+            # We save both 'Wet' (Final) and 'Dry' (Anechoic) to hear what the model learned.
+            with torch.no_grad():
+                # Normalize for wav file
+                target_wav = audio_target[0].cpu().numpy()
+                wet_wav = wet_pred[0].cpu().numpy()
+                dry_wav = dry_pred[0].cpu().numpy()
+
+                scipy.io.wavfile.write(f"checkpoints/ep{epoch}_target.wav", 16000, target_wav)
+                scipy.io.wavfile.write(f"checkpoints/ep{epoch}_recon_wet.wav", 16000, wet_wav)
+                scipy.io.wavfile.write(f"checkpoints/ep{epoch}_recon_dry.wav", 16000, dry_wav)
+            print(f"--> Saved checkpoint and audio samples to 'checkpoints/'")
+
+
+def process_tsv():
+    # Replace with your actual file path
+    file_path = "/Users/kureta/Music/cv-corpus-23.0-2025-09-05/tr/validated.tsv"
+    # 1. Load the TSV file
+    # Polars uses read_csv with a separator argument for TSV
+    df = pl.read_csv(file_path, separator="\t", ignore_errors=True, encoding="utf-8", quote_char="")
+
+    # 2. Apply Filters
+    # - path is not null
+    # - age is not null
+    # - gender is exactly 'male' or 'female'
+    filtered_df = df.filter(
+        pl.col("path").is_not_null() &
+        pl.col("age").is_not_null() &
+        pl.col("gender").is_not_null()
+    ).select(["path", "age", "gender"])  # Discard everything else
+
+    # 3. Inspect results
+    print(f"Original rows: {len(df)}")
+    print(f"Filtered rows: {len(filtered_df)}")
+    print(filtered_df.head())
+
+    # Optional: Save back to TSV
+    filtered_df.write_csv("filtered_dataset.csv")
+
+    # Extract unique values
+    unique_genders = filtered_df.select(pl.col("gender").unique()).to_series().to_list()
+    unique_ages = filtered_df.select(pl.col("age").unique()).to_series().to_list()
+
+    print("Unique Genders:", unique_genders)
+    print("Unique Ages:", unique_ages)
+
+
+def load_csv():
+    file_path = "filtered_dataset.csv"
+    df = pl.read_csv(file_path, ignore_errors=True, encoding="utf-8", quote_char="")
+
+    return df
+
+def get_info(df):
+    print(df.head())
+    print(f"Rows: {len(df)}")
+
+    # Extract unique values
+    unique_genders = df.select(pl.col("gender").unique()).to_series().to_list()
+    unique_ages = df.select(pl.col("age").unique()).to_series().to_list()
+
+    print("Unique Genders:", unique_genders)
+    print("Unique Ages:", unique_ages)
+
+    # Set config to display all rows
+    pl.Config.set_tbl_rows(-1)
+
+    # 2. Group by both columns and count
+    age_gender_counts = (
+        df.group_by(["age", "gender"])
+        .len()  # Counts rows in each group (aliased as 'len' or 'count')
+        .sort(["age", "gender"])  # Sort for readability
+    )
+
+    print(age_gender_counts)
+
+age_map = {
+    'teens': 16.0,
+    'twenties': 25.0,
+    'thirties': 35.0,
+    'fourties': 45.0,
+    'fifties': 55.0,
+    'sixties': 65.0,
+    'seventies': 75.0,
+    'eighties': 85.0
+}
+
+
+def encode_age(age_str):
+    if age_str not in age_map:
+        return 0.3  # Default to ~30 if unknown
+
+    raw_age = age_map[age_str]
+    norm_age = raw_age / 100.0  # e.g., 'twenties' -> 0.25
+    return norm_age
+
+
+# --- Test ---
+def main():
+    # df = load_csv()
+    # get_info(df)
+    # return
+    # Replace with your actual wav file
+    wav_file = "/Users/kureta/Music/cv-corpus-23.0-2025-09-05/tr/clips/common_voice_tr_43561583.mp3"
+
+    # Create dummy file if it doesn't exist for testing
+    if not os.path.exists(wav_file):
+        print("Creating dummy input file...")
+        dummy = torch.sin(2 * 3.1415 * 440 * torch.linspace(0, 5, 16000 * 5))
+        scipy.io.wavfile.write(wav_file, 16000, dummy.numpy())
+
+    train_overfit(wav_file, epochs=10000, save_interval=100)
 
 
 if __name__ == "__main__":
-    run_ah_ee_neural()
+    main()

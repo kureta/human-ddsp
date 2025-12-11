@@ -15,3 +15,5 @@ wheels/
 
 # data
 *.wav
+*.csv
+checkpoints/
