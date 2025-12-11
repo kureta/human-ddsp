@@ -1,4 +1,5 @@
 import os
+import random
 
 import numpy as np
 import polars as pl
@@ -353,23 +354,15 @@ class LearnableReverb(nn.Module):
         return wet_audio.squeeze(1)[..., :dry_len]
 
 
+# --- Updated Controller ---
 class VoiceController(nn.Module):
-    def __init__(self,
-                 z_dim=128,
-                 n_filter_bins=65,
-                 hidden_dim=512,
-                 n_layers=3):
+    def __init__(self, z_dim=128, n_filter_bins=65, hidden_dim=512, n_layers=3):
         super().__init__()
-        self.n_filter_bins = n_filter_bins
 
-        # 1. Input Preprocessing
-        # We concatenate z (128) + f0 (1) + loudness (1)
-        input_dim = z_dim + 1 + 1
+        # Inputs:
+        # z (128) + f0 (1) + loudness (1) + gender (1) + age (1)
+        input_dim = z_dim + 4
 
-        # 2. The Main "Brain" (MLP)
-        # Using GRU here is optional.
-        # Since the Encoder handled the time-context, an MLP is often enough
-        # and has zero latency for the decoding step.
         layers = []
         for i in range(n_layers):
             in_d = input_dim if i == 0 else hidden_dim
@@ -379,98 +372,63 @@ class VoiceController(nn.Module):
 
         self.mlp = nn.Sequential(*layers)
 
-        # 3. Output Projections (The "Knobs")
-
-        # A. Open Quotient (Breathiness) -> Scalar (0.0 to 1.0)
         self.proj_oq = nn.Linear(hidden_dim, 1)
-
-        # B. Vocal Tract Curve (Vowels) -> 65 frequency bins (0.0 to 1.0)
         self.proj_vt = nn.Linear(hidden_dim, n_filter_bins)
-
-        # C. Noise Filter Curve (Consonants) -> 65 frequency bins (0.0 to 1.0)
         self.proj_nf = nn.Linear(hidden_dim, n_filter_bins)
 
-    def forward(self, f0, loudness_db, z):
-        """
-        Args:
-            f0: [Batch, Frames, 1] (Hz)
-            loudness_db: [Batch, Frames, 1] (dB)
-            z: [Batch, Frames, z_dim]
-
-        Returns:
-            Dictionary of controls, ready for NeuralVoiceDecoder
-        """
-        # 1. Normalize Physical Inputs for the Neural Net
-        # Neural Nets hate raw Hz (100-1000) and dB (-100 to 0).
-        # We scale them roughly to [0, 1] or [-1, 1] range.
-
-        # Log-scale F0 is better for pitch perception
-        # map 50Hz..1000Hz -> approx 0..1
+    def forward(self, f0, loudness_db, z, gender, age):
+        # 1. Normalize Audio Features
         f0_norm = (torch.log(f0 + 1e-5) - 4.0) / 4.0
-
-        # Loudness: map -100dB..0dB -> 0..1
         loudness_norm = (loudness_db / 100.0) + 1.0
-        loudness_norm = torch.clamp(loudness_norm, 0.0, 1.0)
 
-        # Concatenate: [Batch, Frames, z_dim + 2]
-        decoder_input = torch.cat([z, f0_norm, loudness_norm], dim=-1)
+        # 2. Broadcast Conditions [Batch] -> [Batch, Frames, 1]
+        frames = z.shape[1]
 
-        # 2. Pass through MLP
+        # Reshape to [B, 1, 1] then expand
+        gender_bc = gender.view(-1, 1, 1).expand(-1, frames, -1)
+        age_bc = age.view(-1, 1, 1).expand(-1, frames, -1)
+
+        # 3. Concatenate
+        decoder_input = torch.cat([z, f0_norm, loudness_norm, gender_bc, age_bc], dim=-1)
+
+        # 4. MLP
         hidden = self.mlp(decoder_input)
 
-        # 3. Project to Controls
-
-        # Open Quotient: Sigmoid (0 to 1)
-        # Bias the initialization so it starts near 0.5 (normal voice)
-        oq = torch.sigmoid(self.proj_oq(hidden))
-
-        # Vocal Tract (The Formants)
-        # Modified Sigmoid allows it to be perfectly zero if needed
-        # We want smooth curves.
-        vt_curve = torch.sigmoid(self.proj_vt(hidden))
-
-        # Noise Filter (The Hiss)
-        # Usually mostly zero, so standard sigmoid is fine
-        nf_curve = torch.sigmoid(self.proj_nf(hidden))
-
-        # 4. Convert Loudness dB to Linear Amplitude for the Synth
-        # amp = 10 ^ (db / 20)
-        amplitude_linear = torch.pow(10.0, loudness_db / 20.0)
-
-        # Return everything needed by NeuralVoiceDecoder
+        # 5. Output
         return {
-            "f0": f0,  # Pass through raw F0
-            "amplitude": amplitude_linear,  # Pass through linear amp
-            "open_quotient": oq,
-            "vocal_tract_curve": vt_curve,
-            "noise_filter_curve": nf_curve
+            "f0": f0,
+            "amplitude": torch.pow(10.0, loudness_db / 20.0),
+            "open_quotient": torch.sigmoid(self.proj_oq(hidden)),
+            "vocal_tract_curve": torch.sigmoid(self.proj_vt(hidden)),
+            "noise_filter_curve": torch.sigmoid(self.proj_nf(hidden))
         }
 
 
+# --- Updated AutoEncoder ---
 class VoiceAutoEncoder(nn.Module):
     def __init__(self, sample_rate=16000):
         super().__init__()
         self.encoder = AudioFeatureEncoder(sample_rate=sample_rate)
+        # Note: Controller now handles extra inputs implicitly via forward args
         self.controller = VoiceController(z_dim=128, n_filter_bins=65)
         self.decoder = NeuralVoiceDecoder(sample_rate=sample_rate, n_filter_bins=65)
         self.reverb = LearnableReverb(sample_rate=sample_rate, reverb_duration=0.5)
 
-    def forward(self, audio):
-        # 1. Features
+    def forward(self, audio, gender, age):
+        # 1. Extract Features
         f0, loud_db, z = self.encoder(audio)
 
-        # 2. Controls
-        controls = self.controller(f0, loud_db, z)
+        # 2. Predict Controls (Now with conditions)
+        controls = self.controller(f0, loud_db, z, gender, age)
 
-        # 3. Synthesis
-        # PASS THE TARGET LENGTH HERE
+        # 3. Synthesize
         dry_audio = self.decoder(
             f0=controls['f0'],
             amplitude=controls['amplitude'],
             open_quotient=controls['open_quotient'],
             vocal_tract_curve=controls['vocal_tract_curve'],
             noise_filter_curve=controls['noise_filter_curve'],
-            target_length=audio.shape[-1]  # <--- Fix
+            target_length=audio.shape[-1]
         )
 
         # 4. Reverb
@@ -600,6 +558,82 @@ class SingleAudioDataset(Dataset):
         return self.data[start:end]
 
 
+class CsvAudioDataset(Dataset):
+    def __init__(self, csv_path, clips_root, sample_rate=16000, chunk_size=32000, limit=4):
+        """
+        csv_path: Path to the filtered CSV/TSV.
+        clips_root: Folder where the mp3 files are actually located.
+        limit: Number of rows to sample (for overfitting).
+        """
+        self.sr = sample_rate
+        self.chunk_size = chunk_size
+        self.clips_root = clips_root
+
+        # 1. Load CSV
+        df = pl.read_csv(csv_path, separator=",")  # Assuming comma for the table you showed
+
+        # 2. Pick random sample for overfitting
+        # We shuffle and take top 'limit'
+        self.data = df.sample(n=limit, with_replacement=False)
+        print(f"Overfitting on these {limit} clips:\n{self.data}")
+
+        # 3. Define Mappings
+        self.age_map = {
+            'teens': 0.16, 'twenties': 0.25, 'thirties': 0.35,
+            'fourties': 0.45, 'fifties': 0.55, 'sixties': 0.65,
+            'seventies': 0.75, 'eighties': 0.85
+        }
+
+    def __len__(self):
+        # For training loops, we usually want a 'virtual' length so
+        # one epoch isn't just 4 steps. Let's multiply by 100.
+        return len(self.data) * 100
+
+    def __getitem__(self, idx):
+        # Modulo index to cycle through our 4 rows
+        real_idx = idx % len(self.data)
+        row = self.data.row(real_idx, named=True)
+
+        # 1. Load Audio
+        full_path = os.path.join(self.clips_root, row['path'])
+
+        # Helper to load and chunk
+        # (We load fresh every time to allow random cropping if file is long)
+        audio, sr = torchaudio.load(full_path)
+
+        # Mix mono
+        if audio.shape[0] > 1: audio = torch.mean(audio, dim=0, keepdim=True)
+
+        # Resample
+        if sr != self.sr:
+            audio = torchaudio.transforms.Resample(sr, self.sr)(audio)
+
+        # Crop Random Chunk
+        total_samples = audio.shape[-1]
+        if total_samples > self.chunk_size:
+            start = random.randint(0, total_samples - self.chunk_size)
+            audio_chunk = audio[0, start: start + self.chunk_size]
+        else:
+            # Pad if too short
+            audio_chunk = F.pad(audio[0], (0, self.chunk_size - total_samples))
+
+        # 2. Process Conditions
+        # Age
+        age_str = row['age']
+        age_val = self.age_map.get(age_str, 0.30)  # Default to 30
+
+        # Gender (male=0, female=1)
+        gender_str = row['gender']
+        gender_val = 1.0 if 'female' in gender_str else 0.0
+
+        # Return Tensors
+        return (
+            audio_chunk,  # [Time]
+            torch.tensor(gender_val).float(),  # Scalar
+            torch.tensor(age_val).float()  # Scalar
+        )
+
+
 # ==========================================
 # 2. The Training Loop
 # ==========================================
@@ -678,9 +712,7 @@ def train_overfit(wav_path, epochs=1000, batch_size=8, lr=1e-4, save_interval=50
             print(f"--> Saved checkpoint and audio samples to 'checkpoints/'")
 
 
-def process_tsv():
-    # Replace with your actual file path
-    file_path = "/Users/kureta/Music/cv-corpus-23.0-2025-09-05/tr/validated.tsv"
+def process_tsv(file_path, output_path):
     # 1. Load the TSV file
     # Polars uses read_csv with a separator argument for TSV
     df = pl.read_csv(file_path, separator="\t", ignore_errors=True, encoding="utf-8", quote_char="")
@@ -701,7 +733,7 @@ def process_tsv():
     print(filtered_df.head())
 
     # Optional: Save back to TSV
-    filtered_df.write_csv("filtered_dataset.csv")
+    filtered_df.write_csv(output_path)
 
     # Extract unique values
     unique_genders = filtered_df.select(pl.col("gender").unique()).to_series().to_list()
@@ -711,11 +743,11 @@ def process_tsv():
     print("Unique Ages:", unique_ages)
 
 
-def load_csv():
-    file_path = "filtered_dataset.csv"
+def load_csv(file_path):
     df = pl.read_csv(file_path, ignore_errors=True, encoding="utf-8", quote_char="")
 
     return df
+
 
 def get_info(df):
     print(df.head())
@@ -740,6 +772,7 @@ def get_info(df):
 
     print(age_gender_counts)
 
+
 age_map = {
     'teens': 16.0,
     'twenties': 25.0,
@@ -763,19 +796,94 @@ def encode_age(age_str):
 
 # --- Test ---
 def main():
-    # df = load_csv()
-    # get_info(df)
-    # return
-    # Replace with your actual wav file
-    wav_file = "/Users/kureta/Music/cv-corpus-23.0-2025-09-05/tr/clips/common_voice_tr_43561583.mp3"
+    # --- Configuration ---
+    CSV_PATH = "data/filtered_dataset.csv"
+    CLIPS_DIR = "data/cv-corpus-23.0-2025-09-05/tr/clips"
+    # TSV_PATH = "data/cv-corpus-23.0-2025-09-05/tr/validated.tsv"
+    DEVICE = "cpu"
+    if torch.cuda.is_available():
+        DEVICE = "cuda"
+    elif torch.backends.mps.is_available():
+        DEVICE = torch.device("mps")
+    SAMPLE_RATE = 16000
+    N_EPOCHS = 100
+    N_CHECKPOINTS = 10
 
-    # Create dummy file if it doesn't exist for testing
-    if not os.path.exists(wav_file):
-        print("Creating dummy input file...")
-        dummy = torch.sin(2 * 3.1415 * 440 * torch.linspace(0, 5, 16000 * 5))
-        scipy.io.wavfile.write(wav_file, 16000, dummy.numpy())
+    # process_tsv(TSV_PATH, CSV_PATH)
 
-    train_overfit(wav_file, epochs=10000, save_interval=100)
+    # --- Data ---
+    dataset = CsvAudioDataset(
+        csv_path=CSV_PATH,
+        clips_root=CLIPS_DIR,
+        limit=4  # Load 4 random files to overfit
+    )
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+
+    # --- Model ---
+    model = VoiceAutoEncoder(sample_rate=SAMPLE_RATE).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    criterion = MultiScaleSpectralLoss().to(DEVICE)  # Or auraloss
+
+    print("Starting Training...")
+
+    # --- Loop ---
+    for epoch in range(1, N_EPOCHS):
+        total_loss = 0.0
+
+        for batch in dataloader:
+            # Unpack
+            audio, gender, age = batch
+            audio = audio.to(DEVICE)
+            gender = gender.to(DEVICE)
+            age = age.to(DEVICE)
+
+            optimizer.zero_grad()
+
+            # Forward (Pass conditions)
+            wet, dry, _ = model(audio, gender, age)
+
+            # Loss
+            loss = criterion(wet, audio)
+            loss.backward()
+
+            # Clip & Step
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        # Log
+        if epoch % 1 == 0:
+            print(f"Epoch {epoch} | Loss: {total_loss / len(dataloader):.4f}")
+
+        # Save Random Sample
+        if epoch % N_CHECKPOINTS == 0:
+            os.makedirs("checkpoints", exist_ok=True)
+
+            # 1. SAVE MODEL WEIGHTS (This was missing)
+            torch.save(model.state_dict(), f"checkpoints/model_ep{epoch}.pth")
+
+            with torch.no_grad():
+                # Pick random index from this batch to save
+                # (Ensures we don't just hear the first file every time)
+                ridx = random.randint(0, audio.shape[0] - 1)
+
+                # Get data
+                tgt = audio[ridx].cpu().numpy()
+                out = wet[ridx].cpu().numpy()
+
+                # Info string for filename
+                g_str = "Fem" if gender[ridx].item() > 0.5 else "Male"
+                a_val = age[ridx].item()
+
+                # Save
+                fname_base = f"checkpoints/ep{epoch}_{g_str}_Age{a_val:.2f}"
+                scipy.io.wavfile.write(f"{fname_base}_target.wav", SAMPLE_RATE, tgt)
+                scipy.io.wavfile.write(f"{fname_base}_recon.wav", SAMPLE_RATE, out)
+
+            print(f"Saved checkpoint and audio to checkpoints/model_ep{epoch}.pth")
+
+    print("Done.")
 
 
 if __name__ == "__main__":

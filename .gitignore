@@ -17,3 +17,4 @@ wheels/
 *.wav
 *.csv
 checkpoints/
+data/
