@@ -1,5 +1,6 @@
 # pyright: basic
 
+import math
 import os
 import random
 
@@ -151,7 +152,6 @@ class LearnableReverb(nn.Module):
 
         batch, channels, dry_len = x.shape
         fft_size = dry_len + self.impulse_response.shape[-1] - 1
-        import math
 
         n_fft = 2 ** math.ceil(math.log2(fft_size))
 
@@ -174,7 +174,7 @@ class AudioFeatureEncoder(nn.Module):
         n_fft=1024,
         hop_length=256,
         n_mels=80,
-        z_dim=64,
+        z_dim=16,
         gru_units=256,
     ):
         super().__init__()
@@ -230,8 +230,22 @@ class AudioFeatureEncoder(nn.Module):
         mels = torch.log(mels + 1e-5)
         mels = self.norm(mels)
         mels = mels.transpose(1, 2)
+
         rnn_out, _ = self.rnn(mels)
-        return self.projection(rnn_out)
+        z = self.projection(rnn_out)  # [Batch, Time, 16]
+
+        # --- TEMPORAL BOTTLENECK ---
+        # 1. Downsample by factor of 4 (Time / 4)
+        # We average every 4 frames together.
+        z_down = F.avg_pool1d(z.transpose(1, 2), kernel_size=4, stride=4)
+
+        # 2. Upsample back to original length
+        # Linear interpolation creates smooth transitions between phonemes
+        z_up = F.interpolate(
+            z_down, size=z.shape[1], mode="linear", align_corners=False
+        )
+
+        return z_up.transpose(1, 2)
 
     def forward(self, audio):
         f0 = self.get_pitch(audio)
@@ -242,7 +256,7 @@ class AudioFeatureEncoder(nn.Module):
 
 
 class VoiceController(nn.Module):
-    def __init__(self, z_dim=64, n_filter_bins=65, hidden_dim=512, n_layers=3):
+    def __init__(self, z_dim=16, n_filter_bins=65, hidden_dim=512, n_layers=3):
         super().__init__()
         # z(64) + f0(1) + loud(1) + gender(2) + age(1) = 69
         input_dim = z_dim + 5
@@ -284,8 +298,8 @@ class VoiceController(nn.Module):
 class VoiceAutoEncoder(nn.Module):
     def __init__(self, sample_rate=16000):
         super().__init__()
-        self.encoder = AudioFeatureEncoder(sample_rate=sample_rate, z_dim=64)
-        self.controller = VoiceController(z_dim=64, n_filter_bins=65)
+        self.encoder = AudioFeatureEncoder(sample_rate=sample_rate, z_dim=16)
+        self.controller = VoiceController(z_dim=16, n_filter_bins=65)
         self.decoder = NeuralVoiceDecoder(sample_rate=sample_rate, n_filter_bins=65)
         self.reverb = LearnableReverb(sample_rate=sample_rate, reverb_duration=0.5)
 
@@ -627,4 +641,4 @@ def inference():
 
 
 if __name__ == "__main__":
-    inference()
+    training()
