@@ -24,13 +24,18 @@ except ImportError:
 # 1. DSP & Helper Modules
 # ==========================================
 
+
 def _create_a_weighting(n_fft, sr):
     """Creates the A-weighting curve for Perceptual Loudness."""
     freqs = torch.linspace(0, sr / 2, n_fft // 2 + 1)
-    f_sq = freqs ** 2
-    term1 = 12194.217 ** 2 * f_sq ** 2
-    term2 = (f_sq + 20.6 ** 2) * (f_sq + 107.7 ** 2) * \
-            (f_sq + 737.9 ** 2) * (f_sq + 12194.217 ** 2) ** 0.5
+    f_sq = freqs**2
+    term1 = 12194.217**2 * f_sq**2
+    term2 = (
+        (f_sq + 20.6**2)
+        * (f_sq + 107.7**2)
+        * (f_sq + 737.9**2)
+        * (f_sq + 12194.217**2) ** 0.5
+    )
     gain = term1 / (term2 + 1e-8)
     return gain
 
@@ -42,7 +47,7 @@ class NeuralVoiceDecoder(nn.Module):
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.n_filter_bins = n_filter_bins
-        self.register_buffer('window', torch.hann_window(n_fft))
+        self.register_buffer("window", torch.hann_window(n_fft))
 
     def rosenberg_source(self, f0, open_quotient):
         # f0, OQ: [Batch, Time]
@@ -69,21 +74,20 @@ class NeuralVoiceDecoder(nn.Module):
             win_length=self.n_fft,
             window=self.window,
             center=True,
-            return_complex=True
+            return_complex=True,
         )
 
         # 2. Interpolate Filter
         filter_mod = filter_magnitudes.transpose(1, 2)
         filter_resized = F.interpolate(
-            filter_mod,
-            size=ex_stft.shape[2],
-            mode='linear', align_corners=False
+            filter_mod, size=ex_stft.shape[2], mode="linear", align_corners=False
         )
         target_bins = ex_stft.shape[1]
         filter_final = F.interpolate(
             filter_resized.transpose(1, 2),
             size=target_bins,
-            mode='linear', align_corners=False
+            mode="linear",
+            align_corners=False,
         ).transpose(1, 2)
 
         # 3. Filter
@@ -96,17 +100,25 @@ class NeuralVoiceDecoder(nn.Module):
             self.hop_length,
             win_length=self.n_fft,
             window=self.window,
-            length=excitation.shape[-1]
+            length=excitation.shape[-1],
         )
         return output_audio
 
     @staticmethod
     def _upsample(x, target_length: int):
         x = x.transpose(1, 2)
-        x = F.interpolate(x, size=target_length, mode='linear', align_corners=False)
+        x = F.interpolate(x, size=target_length, mode="linear", align_corners=False)
         return x.squeeze(1)
 
-    def forward(self, f0, amplitude, open_quotient, vocal_tract_curve, noise_filter_curve, target_length: int):
+    def forward(
+        self,
+        f0,
+        amplitude,
+        open_quotient,
+        vocal_tract_curve,
+        noise_filter_curve,
+        target_length: int,
+    ):
         f0_up = self._upsample(f0, target_length)
         amp_up = self._upsample(amplitude, target_length)
         oq_up = self._upsample(open_quotient, target_length)
@@ -140,6 +152,7 @@ class LearnableReverb(nn.Module):
         batch, channels, dry_len = x.shape
         fft_size = dry_len + self.impulse_response.shape[-1] - 1
         import math
+
         n_fft = 2 ** math.ceil(math.log2(fft_size))
 
         dry_fft = torch.fft.rfft(x, n=n_fft, dim=-1)
@@ -153,31 +166,42 @@ class LearnableReverb(nn.Module):
 # 2. Encoder & Controller
 # ==========================================
 
+
 class AudioFeatureEncoder(nn.Module):
-    def __init__(self, sample_rate=16000, n_fft=1024, hop_length=256, n_mels=80, z_dim=64, gru_units=256):
+    def __init__(
+        self,
+        sample_rate=16000,
+        n_fft=1024,
+        hop_length=256,
+        n_mels=80,
+        z_dim=64,
+        gru_units=256,
+    ):
         super().__init__()
         self.sample_rate = sample_rate
         self.hop_length = hop_length
         self.n_fft = n_fft
 
         self.spectrogram = T.Spectrogram(n_fft=n_fft, hop_length=hop_length, power=2.0)
-        self.register_buffer('a_weighting', _create_a_weighting(n_fft, sample_rate))
+        self.register_buffer("a_weighting", _create_a_weighting(n_fft, sample_rate))
 
-        self.melspec = T.MelSpectrogram(sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels)
+        self.melspec = T.MelSpectrogram(
+            sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels
+        )
         self.norm = nn.InstanceNorm1d(n_mels)
         self.rnn = nn.GRU(n_mels, gru_units, batch_first=True)
         self.projection = nn.Linear(gru_units, z_dim)
 
     def get_pitch(self, audio):
         pad = self.n_fft // 2
-        audio_pad = F.pad(audio.unsqueeze(1), (pad, pad), mode='reflect').squeeze(1)
+        audio_pad = F.pad(audio.unsqueeze(1), (pad, pad), mode="reflect").squeeze(1)
         frames = audio_pad.unfold(dimension=-1, size=self.n_fft, step=self.hop_length)
 
         n_fft_corr = 2 * self.n_fft
         spec = torch.fft.rfft(frames, n=n_fft_corr, dim=-1)
         power_spec = spec.abs().pow(2)
         autocorr = torch.fft.irfft(power_spec, n=n_fft_corr, dim=-1)
-        autocorr = autocorr[..., :self.n_fft]
+        autocorr = autocorr[..., : self.n_fft]
 
         norm_factor = autocorr[..., 0:1] + 1e-8
         norm_autocorr = autocorr / norm_factor
@@ -243,7 +267,9 @@ class VoiceController(nn.Module):
         gender_bc = gender.view(-1, 1, 2).expand(-1, frames, -1)
         age_bc = age.view(-1, 1, 1).expand(-1, frames, -1)
 
-        decoder_input = torch.cat([z, f0_norm, loudness_norm, gender_bc, age_bc], dim=-1)
+        decoder_input = torch.cat(
+            [z, f0_norm, loudness_norm, gender_bc, age_bc], dim=-1
+        )
         hidden = self.mlp(decoder_input)
 
         return {
@@ -251,7 +277,7 @@ class VoiceController(nn.Module):
             "amplitude": torch.pow(10.0, loudness_db / 20.0),
             "open_quotient": torch.sigmoid(self.proj_oq(hidden)),
             "vocal_tract_curve": torch.sigmoid(self.proj_vt(hidden)),
-            "noise_filter_curve": torch.sigmoid(self.proj_nf(hidden))
+            "noise_filter_curve": torch.sigmoid(self.proj_nf(hidden)),
         }
 
 
@@ -267,12 +293,12 @@ class VoiceAutoEncoder(nn.Module):
         f0, loud_db, z = self.encoder(audio)
         controls = self.controller(f0, loud_db, z, gender, age)
         dry_audio = self.decoder(
-            f0=controls['f0'],
-            amplitude=controls['amplitude'],
-            open_quotient=controls['open_quotient'],
-            vocal_tract_curve=controls['vocal_tract_curve'],
-            noise_filter_curve=controls['noise_filter_curve'],
-            target_length=audio.shape[-1]
+            f0=controls["f0"],
+            amplitude=controls["amplitude"],
+            open_quotient=controls["open_quotient"],
+            vocal_tract_curve=controls["vocal_tract_curve"],
+            noise_filter_curve=controls["noise_filter_curve"],
+            target_length=audio.shape[-1],
         )
         wet_audio = self.reverb(dry_audio)
         return wet_audio, dry_audio, controls
@@ -291,7 +317,15 @@ class MultiScaleSpectralLoss(nn.Module):
     def spectrogram(x, n_fft):
         hop_length = int(n_fft * 0.25)
         window = torch.hann_window(n_fft).to(x.device)
-        x_stft = torch.stft(x, n_fft, hop_length, win_length=n_fft, window=window, return_complex=True, center=True)
+        x_stft = torch.stft(
+            x,
+            n_fft,
+            hop_length,
+            win_length=n_fft,
+            window=window,
+            return_complex=True,
+            center=True,
+        )
         return torch.clamp(torch.abs(x_stft), min=1e-7)
 
     def forward(self, x_pred, x_target):
@@ -300,7 +334,9 @@ class MultiScaleSpectralLoss(nn.Module):
             mag_pred = self.spectrogram(x_pred, n_fft)
             mag_target = self.spectrogram(x_target, n_fft)
             loss += self.mag_weight * F.l1_loss(mag_pred, mag_target)
-            loss += self.log_mag_weight * F.l1_loss(torch.log(mag_pred), torch.log(mag_target))
+            loss += self.log_mag_weight * F.l1_loss(
+                torch.log(mag_pred), torch.log(mag_target)
+            )
         return loss
 
 
@@ -310,11 +346,14 @@ class MultiScaleSpectralLoss(nn.Module):
 
 
 class CsvAudioDataset(Dataset):
-    def __init__(self, csv_path, clips_root, sample_rate=16000, chunk_size=32000, limit=4):
+    def __init__(
+        self, csv_path, clips_root, sample_rate=16000, chunk_size=32000, limit=4
+    ):
         self.sr = sample_rate
         self.chunk_size = chunk_size
         self.clips_root = clips_root
-        if pl is None: raise ImportError("Polars required for CsvAudioDataset")
+        if pl is None:
+            raise ImportError("Polars required for CsvAudioDataset")
 
         df = pl.read_csv(csv_path, separator=",")
         if limit > 0:
@@ -322,30 +361,43 @@ class CsvAudioDataset(Dataset):
         else:
             self.data = df
 
-        self.age_map = {'teens': 0.16, 'twenties': 0.25, 'thirties': 0.35,
-                        'fourties': 0.45, 'fifties': 0.55, 'sixties': 0.65,
-                        'seventies': 0.75, 'eighties': 0.85}
+        self.age_map = {
+            "teens": 0.16,
+            "twenties": 0.25,
+            "thirties": 0.35,
+            "fourties": 0.45,
+            "fifties": 0.55,
+            "sixties": 0.65,
+            "seventies": 0.75,
+            "eighties": 0.85,
+        }
 
     def __len__(self):
         return len(self.data) * 50
 
     def __getitem__(self, idx):
         row = self.data.row(idx % len(self.data), named=True)
-        full_path = os.path.join(self.clips_root, row['path'])
+        full_path = os.path.join(self.clips_root, row["path"])
 
         audio, sr = torchaudio.load(full_path)
 
-        if audio.shape[0] > 1: audio = torch.mean(audio, dim=0, keepdim=True)
-        if sr != self.sr: audio = T.Resample(sr, self.sr)(audio)
+        if audio.shape[0] > 1:
+            audio = torch.mean(audio, dim=0, keepdim=True)
+        if sr != self.sr:
+            audio = T.Resample(sr, self.sr)(audio)
 
         if audio.shape[-1] > self.chunk_size:
             start = random.randint(0, audio.shape[-1] - self.chunk_size)
-            chunk = audio[0, start:start + self.chunk_size]
+            chunk = audio[0, start : start + self.chunk_size]
         else:
             chunk = F.pad(audio[0], (0, self.chunk_size - audio.shape[-1]))
 
-        age_val = self.age_map.get(row['age'], 0.30)
-        gender_vec = torch.tensor([0.0, 1.0]) if 'female' in row['gender'] else torch.tensor([1.0, 0.0])
+        age_val = self.age_map.get(row["age"], 0.30)
+        gender_vec = (
+            torch.tensor([0.0, 1.0])
+            if "female" in row["gender"]
+            else torch.tensor([1.0, 0.0])
+        )
         return chunk, gender_vec.float(), torch.tensor(age_val).float()
 
 
@@ -353,10 +405,21 @@ class CsvAudioDataset(Dataset):
 # 4. Inference Helper
 # ==========================================
 
-def convert_voice(model, input_wav, output_wav, target_gender_balance, target_age, pitch_shift=0.0, device='cpu'):
+
+def convert_voice(
+    model,
+    input_wav,
+    output_wav,
+    target_gender_balance,
+    target_age,
+    pitch_shift=0.0,
+    device="cpu",
+):
     audio, sr = torchaudio.load(input_wav)
-    if audio.shape[0] > 1: audio = torch.mean(audio, dim=0, keepdim=True)
-    if sr != 16000: audio = T.Resample(sr, 16000)(audio)
+    if audio.shape[0] > 1:
+        audio = torch.mean(audio, dim=0, keepdim=True)
+    if sr != 16000:
+        audio = T.Resample(sr, 16000)(audio)
 
     audio = audio / (torch.abs(audio).max() + 1e-6)
     audio = audio.to(device)
@@ -380,12 +443,12 @@ def convert_voice(model, input_wav, output_wav, target_gender_balance, target_ag
 
         # 5. Decode
         dry_audio = model.decoder(
-            f0=controls['f0'],
-            amplitude=controls['amplitude'],
-            open_quotient=controls['open_quotient'],
-            vocal_tract_curve=controls['vocal_tract_curve'],
-            noise_filter_curve=controls['noise_filter_curve'],
-            target_length=audio.shape[-1]
+            f0=controls["f0"],
+            amplitude=controls["amplitude"],
+            open_quotient=controls["open_quotient"],
+            vocal_tract_curve=controls["vocal_tract_curve"],
+            noise_filter_curve=controls["noise_filter_curve"],
+            target_length=audio.shape[-1],
         )
         wet_audio = model.reverb(dry_audio)
 
@@ -394,20 +457,25 @@ def convert_voice(model, input_wav, output_wav, target_gender_balance, target_ag
     torchaudio.save(output_wav, wet_audio, 16000)
     print(f"Saved: {output_wav}")
 
+
 def process_tsv(file_path, output_path):
     # 1. Load the TSV file
     # Polars uses read_csv with a separator argument for TSV
-    df = pl.read_csv(file_path, separator="\t", ignore_errors=True, encoding="utf-8", quote_char="")
+    df = pl.read_csv(
+        file_path, separator="\t", ignore_errors=True, encoding="utf-8", quote_char=""
+    )
 
     # 2. Apply Filters
     # - path is not null
     # - age is not null
     # - gender is exactly 'male' or 'female'
     filtered_df = df.filter(
-        pl.col("path").is_not_null() &
-        pl.col("age").is_not_null() &
-        pl.col("gender").is_not_null()
-    ).select(["path", "age", "gender"])  # Discard everything else
+        pl.col("path").is_not_null()
+        & pl.col("age").is_not_null()
+        & pl.col("gender").is_not_null()
+    ).select(
+        ["path", "age", "gender"]
+    )  # Discard everything else
 
     # 3. Inspect results
     print(f"Original rows: {len(df)}")
@@ -423,6 +491,7 @@ def process_tsv(file_path, output_path):
 
     print("Unique Genders:", unique_genders)
     print("Unique Ages:", unique_ages)
+
 
 # ==========================================
 # 5. Main Execution (Fixed: Batch Logging & Configs)
@@ -518,26 +587,44 @@ def training():
                     g_str = "Fem" if gender[ridx, 0].item() < 0.5 else "Male"
                     a_val = age[ridx].item()
 
-                    fname_base = f"{CHECKPOINT_DIR}/step{num_batches}_{g_str}_Age{a_val:.2f}"
+                    fname_base = (
+                        f"{CHECKPOINT_DIR}/step{num_batches}_{g_str}_Age{a_val:.2f}"
+                    )
                     scipy.io.wavfile.write(f"{fname_base}_target.wav", SAMPLE_RATE, tgt)
                     scipy.io.wavfile.write(f"{fname_base}_recon.wav", SAMPLE_RATE, out)
 
                 print(f"--> Saved Checkpoint: {save_path}")
 
+
 def inference():
-        # --- Inference Demo ---
-        model = VoiceAutoEncoder(sample_rate=SAMPLE_RATE).to(DEVICE)
+    # --- Inference Demo ---
+    model = VoiceAutoEncoder(sample_rate=SAMPLE_RATE).to(DEVICE)
 
-        if os.path.exists(CHECKPOINT) and os.path.exists(INPUT_WAV):
-            print(f"Loading {CHECKPOINT}...")
-            model.load_state_dict(torch.load(CHECKPOINT, map_location=DEVICE))
+    if os.path.exists(CHECKPOINT) and os.path.exists(INPUT_WAV):
+        print(f"Loading {CHECKPOINT}...")
+        model.load_state_dict(torch.load(CHECKPOINT, map_location=DEVICE))
 
-            convert_voice(model, INPUT_WAV, "output_female.wav", 1.0, 0.25, pitch_shift=4.0, device=DEVICE)
-            convert_voice(model, INPUT_WAV, "output_old_male.wav", 0.0, 0.85, pitch_shift=-2.0, device=DEVICE)
-        else:
-            print("Checkpoint or Input Wav not found.")
+        convert_voice(
+            model,
+            INPUT_WAV,
+            "generated/output_female.wav",
+            1.0,
+            0.18,
+            pitch_shift=7.0,
+            device=DEVICE,
+        )
+        convert_voice(
+            model,
+            INPUT_WAV,
+            "generated/output_old_male.wav",
+            0.0,
+            0.90,
+            pitch_shift=-3.0,
+            device=DEVICE,
+        )
+    else:
+        print("Checkpoint or Input Wav not found.")
 
 
 if __name__ == "__main__":
-    training()
-
+    inference()
