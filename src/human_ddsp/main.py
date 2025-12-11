@@ -1,6 +1,5 @@
 # pyright: basic
 
-import math
 import os
 import random
 
@@ -153,7 +152,15 @@ class LearnableReverb(nn.Module):
         batch, channels, dry_len = x.shape
         fft_size = dry_len + self.impulse_response.shape[-1] - 1
 
-        n_fft = 2 ** math.ceil(math.log2(fft_size))
+        # --- FIX: Use Torch operations instead of Python math ---
+        # 1. Cast size to float tensor for log2
+        size_tensor = torch.tensor(float(fft_size))
+        
+        # 2. Calculate next power of 2 using torch functions
+        # 2 ^ ceil(log2(size))
+        n_fft_pow = torch.ceil(torch.log2(size_tensor))
+        n_fft = int(2 ** n_fft_pow.item())
+        # ------------------------------------------------------
 
         dry_fft = torch.fft.rfft(x, n=n_fft, dim=-1)
         ir_fft = torch.fft.rfft(self.impulse_response, n=n_fft, dim=-1)
@@ -166,42 +173,33 @@ class LearnableReverb(nn.Module):
 # 2. Encoder & Controller
 # ==========================================
 
-
 class AudioFeatureEncoder(nn.Module):
-    def __init__(
-        self,
-        sample_rate=16000,
-        n_fft=1024,
-        hop_length=256,
-        n_mels=80,
-        z_dim=16,
-        gru_units=256,
-    ):
+    def __init__(self, sample_rate=16000, n_fft=1024, hop_length=256, n_mels=80, z_dim=32, gru_units=256):
         super().__init__()
         self.sample_rate = sample_rate
         self.hop_length = hop_length
         self.n_fft = n_fft
 
+        # Loudness
         self.spectrogram = T.Spectrogram(n_fft=n_fft, hop_length=hop_length, power=2.0)
-        self.register_buffer("a_weighting", _create_a_weighting(n_fft, sample_rate))
+        self.register_buffer('a_weighting', _create_a_weighting(n_fft, sample_rate))
 
-        self.melspec = T.MelSpectrogram(
-            sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels
-        )
+        # Content Encoder
+        self.melspec = T.MelSpectrogram(sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels)
         self.norm = nn.InstanceNorm1d(n_mels)
         self.rnn = nn.GRU(n_mels, gru_units, batch_first=True)
         self.projection = nn.Linear(gru_units, z_dim)
 
     def get_pitch(self, audio):
         pad = self.n_fft // 2
-        audio_pad = F.pad(audio.unsqueeze(1), (pad, pad), mode="reflect").squeeze(1)
+        audio_pad = F.pad(audio.unsqueeze(1), (pad, pad), mode='reflect').squeeze(1)
         frames = audio_pad.unfold(dimension=-1, size=self.n_fft, step=self.hop_length)
 
         n_fft_corr = 2 * self.n_fft
         spec = torch.fft.rfft(frames, n=n_fft_corr, dim=-1)
         power_spec = spec.abs().pow(2)
         autocorr = torch.fft.irfft(power_spec, n=n_fft_corr, dim=-1)
-        autocorr = autocorr[..., : self.n_fft]
+        autocorr = autocorr[..., :self.n_fft]
 
         norm_factor = autocorr[..., 0:1] + 1e-8
         norm_autocorr = autocorr / norm_factor
@@ -214,7 +212,7 @@ class AudioFeatureEncoder(nn.Module):
         max_val, max_idx = torch.max(search_region, dim=-1)
         true_lag = max_idx + min_lag
         f0 = self.sample_rate / (true_lag.float() + 1e-8)
-
+        
         f0[max_val < 0.3] = 0.0
         return f0.unsqueeze(-1)
 
@@ -225,32 +223,39 @@ class AudioFeatureEncoder(nn.Module):
         loudness_db = 10 * torch.log10(mean_power)
         return loudness_db.transpose(1, 2)
 
-    def encode_content(self, audio):
+    def get_mels(self, audio):
+        """Extract Mel-Spectrogram (used for pre-computation and content encoding)."""
         mels = self.melspec(audio)
         mels = torch.log(mels + 1e-5)
         mels = self.norm(mels)
-        mels = mels.transpose(1, 2)
+        mels = mels.transpose(1, 2) # [Batch, Time, Mels]
+        return mels
 
+    def get_content_from_mels(self, mels):
+        """
+        Runs RNN on Mels and applies Temporal Bottleneck.
+        Expected mels shape: [Batch, Time, Mels]
+        """
         rnn_out, _ = self.rnn(mels)
-        z = self.projection(rnn_out)  # [Batch, Time, 16]
-
-        # --- TEMPORAL BOTTLENECK ---
-        # 1. Downsample by factor of 4 (Time / 4)
-        # We average every 4 frames together.
-        z_down = F.avg_pool1d(z.transpose(1, 2), kernel_size=4, stride=4)
-
-        # 2. Upsample back to original length
-        # Linear interpolation creates smooth transitions between phonemes
-        z_up = F.interpolate(
-            z_down, size=z.shape[1], mode="linear", align_corners=False
-        )
-
+        z = self.projection(rnn_out) # [Batch, Time, z_dim]
+        
+        # --- Temporal Bottleneck ---
+        # 1. Downsample (Average Pool)
+        # Transpose to [Batch, Feat, Time] for pooling
+        z_t = z.transpose(1, 2)
+        z_down = F.avg_pool1d(z_t, kernel_size=4, stride=4)
+        
+        # 2. Upsample (Linear Interpolation)
+        z_up = F.interpolate(z_down, size=z.shape[1], mode='linear', align_corners=False)
+        
         return z_up.transpose(1, 2)
 
     def forward(self, audio):
         f0 = self.get_pitch(audio)
         loudness = self.get_loudness(audio)
-        z = self.encode_content(audio)
+        mels = self.get_mels(audio)
+        z = self.get_content_from_mels(mels)
+        
         min_len = min(f0.shape[1], loudness.shape[1], z.shape[1])
         return f0[:, :min_len, :], loudness[:, :min_len, :], z[:, :min_len, :]
 
