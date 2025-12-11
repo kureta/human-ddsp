@@ -171,34 +171,15 @@ def _create_a_weighting(n_fft, sr):
 
 
 class AudioFeatureEncoder(nn.Module):
-    def __init__(self,
-                 sample_rate=16000,
-                 n_fft=1024,
-                 hop_length=256,
-                 n_mels=80,
-                 z_dim=128,
-                 gru_units=512,
-                 gru_layers=2,
-                 ):
+    def __init__(self, sample_rate=16000, n_fft=1024, hop_length=256):
         super().__init__()
         self.sample_rate = sample_rate
         self.hop_length = hop_length
         self.n_fft = n_fft
 
-        # --- 1. Loudness Tools ---
+        # Loudness Tools
         self.spectrogram = T.Spectrogram(n_fft=n_fft, hop_length=hop_length, power=2.0)
         self.register_buffer('a_weighting', _create_a_weighting(n_fft, sample_rate))
-
-        # --- 2. Real-Time Timbre Encoder ---
-        self.melspec = T.MelSpectrogram(
-            sample_rate=sample_rate,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            n_mels=n_mels
-        )
-        self.norm = nn.InstanceNorm1d(n_mels)
-        self.rnn = nn.GRU(n_mels, gru_units, gru_layers, batch_first=True, bidirectional=False)
-        self.projection = nn.Linear(gru_units, z_dim)
 
     def get_pitch(self, audio):
         """
@@ -285,11 +266,10 @@ class AudioFeatureEncoder(nn.Module):
     def forward(self, audio):
         f0 = self.get_pitch(audio)
         loudness = self.get_loudness(audio)
-        z = self.encode_timbre(audio)
 
-        # Align lengths (Autocorrelation framing vs STFT framing)
-        min_len = min(f0.shape[1], loudness.shape[1], z.shape[1])
-        return f0[:, :min_len, :], loudness[:, :min_len, :], z[:, :min_len, :]
+        # Align lengths
+        min_len = min(f0.shape[1], loudness.shape[1])
+        return f0[:, :min_len, :], loudness[:, :min_len, :]
 
 
 class LearnableReverb(nn.Module):
@@ -356,12 +336,12 @@ class LearnableReverb(nn.Module):
 
 # --- Updated Controller ---
 class VoiceController(nn.Module):
-    def __init__(self, z_dim=128, n_filter_bins=65, hidden_dim=512, n_layers=3):
+    def __init__(self, n_filter_bins=65, hidden_dim=512, n_layers=3):
         super().__init__()
 
         # Inputs:
-        # z (128) + f0 (1) + loudness (1) + gender (1) + age (1)
-        input_dim = z_dim + 4
+        # f0 (1) + loudness (1) + gender (1) + age (1)
+        input_dim = 4
 
         layers = []
         for i in range(n_layers):
@@ -376,25 +356,22 @@ class VoiceController(nn.Module):
         self.proj_vt = nn.Linear(hidden_dim, n_filter_bins)
         self.proj_nf = nn.Linear(hidden_dim, n_filter_bins)
 
-    def forward(self, f0, loudness_db, z, gender, age):
+    def forward(self, f0, loudness_db, gender, age):
         # 1. Normalize Audio Features
         f0_norm = (torch.log(f0 + 1e-5) - 4.0) / 4.0
         loudness_norm = (loudness_db / 100.0) + 1.0
 
-        # 2. Broadcast Conditions [Batch] -> [Batch, Frames, 1]
-        frames = z.shape[1]
-
-        # Reshape to [B, 1, 1] then expand
+        # 2. Broadcast Conditions
+        frames = f0.shape[1]
         gender_bc = gender.view(-1, 1, 1).expand(-1, frames, -1)
         age_bc = age.view(-1, 1, 1).expand(-1, frames, -1)
 
-        # 3. Concatenate
-        decoder_input = torch.cat([z, f0_norm, loudness_norm, gender_bc, age_bc], dim=-1)
+        # 3. Concatenate (No Z)
+        decoder_input = torch.cat([f0_norm, loudness_norm, gender_bc, age_bc], dim=-1)
 
         # 4. MLP
         hidden = self.mlp(decoder_input)
 
-        # 5. Output
         return {
             "f0": f0,
             "amplitude": torch.pow(10.0, loudness_db / 20.0),
@@ -409,17 +386,16 @@ class VoiceAutoEncoder(nn.Module):
     def __init__(self, sample_rate=16000):
         super().__init__()
         self.encoder = AudioFeatureEncoder(sample_rate=sample_rate)
-        # Note: Controller now handles extra inputs implicitly via forward args
-        self.controller = VoiceController(z_dim=128, n_filter_bins=65)
+        self.controller = VoiceController(n_filter_bins=65)  # No z_dim arg
         self.decoder = NeuralVoiceDecoder(sample_rate=sample_rate, n_filter_bins=65)
         self.reverb = LearnableReverb(sample_rate=sample_rate, reverb_duration=0.5)
 
     def forward(self, audio, gender, age):
-        # 1. Extract Features
-        f0, loud_db, z = self.encoder(audio)
+        # 1. Extract Features (No Z)
+        f0, loud_db = self.encoder(audio)
 
-        # 2. Predict Controls (Now with conditions)
-        controls = self.controller(f0, loud_db, z, gender, age)
+        # 2. Predict Controls
+        controls = self.controller(f0, loud_db, gender, age)
 
         # 3. Synthesize
         dry_audio = self.decoder(
@@ -800,8 +776,9 @@ def encode_age(age_str):
 # --- Test ---
 def main():
     # --- Configuration ---
-    CSV_PATH = "/content/filtered_dataset.csv"
-    CLIPS_DIR = "/content/cv-corpus-23.0-2025-09-05/tr/clips"
+    CSV_PATH = "data/filtered_dataset.csv"
+    CLIPS_DIR = "data/cv-corpus-23.0-2025-09-05/tr/clips"
+    CHECKPOINT_DIR = "checkpoints"
     # TSV_PATH = "/content/cv-corpus-23.0-2025-09-05/tr/validated.tsv"
     DEVICE = "cpu"
     if torch.cuda.is_available():
@@ -809,10 +786,10 @@ def main():
     elif torch.backends.mps.is_available():
         DEVICE = torch.device("mps")
     SAMPLE_RATE = 16000
-    N_EPOCHS = 1000
-    N_CHECKPOINTS = 1000
+    N_EPOCHS = 100
+    N_CHECKPOINTS = 250
     N_LOG = 250
-    LIMIT = 0
+    LIMIT = 4
     BATCH_SIZE = 8
 
     # process_tsv(TSV_PATH, CSV_PATH)
@@ -866,10 +843,10 @@ def main():
 
             # Save Random Sample
             if num_batches % N_CHECKPOINTS == 0:
-                os.makedirs("/content/checkpoints", exist_ok=True)
+                os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
                 # 1. SAVE MODEL WEIGHTS (This was missing)
-                torch.save(model.state_dict(), f"/content/checkpoints/model_ep{epoch}.pth")
+                torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/model_ep{epoch}_batch{num_batches}.pth")
 
                 with torch.no_grad():
                     # Pick random index from this batch to save
@@ -885,7 +862,7 @@ def main():
                     a_val = age[ridx].item()
 
                     # Save
-                    fname_base = f"/content/checkpoints/ep{epoch}_{g_str}_Age{a_val:.2f}"
+                    fname_base = f"{CHECKPOINT_DIR}/ep{epoch}_batch_{num_batches}_{g_str}_Age{a_val:.2f}"
                     scipy.io.wavfile.write(f"{fname_base}_target.wav", SAMPLE_RATE, tgt)
                     scipy.io.wavfile.write(f"{fname_base}_recon.wav", SAMPLE_RATE, out)
 
@@ -936,7 +913,7 @@ def convert_voice(
     model.eval()
     with torch.no_grad():
         # A. Extract Features
-        f0, loud_db, z = model.encoder(audio)
+        f0, loud_db = model.encoder(audio)
 
         # B. Pitch Shift (Modify F0)
         if pitch_shift != 0:
@@ -949,7 +926,7 @@ def convert_voice(
         a_tensor = torch.tensor([target_age], device=device).float()
 
         # D. Predict Controls
-        controls = model.controller(f0, loud_db, z, g_tensor, a_tensor)
+        controls = model.controller(f0, loud_db, g_tensor, a_tensor)
 
         # E. Synthesize
         # We pass target_length to ensure output matches input duration exactly
@@ -1009,4 +986,4 @@ def run_inference_demo():
 
 
 if __name__ == "__main__":
-    run_inference_demo()
+    main()
