@@ -541,7 +541,7 @@ if torch.cuda.is_available():
 elif torch.backends.mps.is_available():
     DEVICE = "mps"
 
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 48000
 N_EPOCHS = 100
 
 # Restored Variables
