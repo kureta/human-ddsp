@@ -18,6 +18,7 @@ Lightweight differentiable digital signal processing (DDSP) voice autoencoder wi
 - Added device-safe state handling in `ScriptedDDSP.forward` so RNN and phase buffers follow the incoming audio device even when batch size is constant.
 - Cached the block Hann window as a registered buffer to cut per-block allocations during streaming inference.
 - Wrapped streaming inference in `torch.no_grad()` and added type hints for exported methods and helper utilities to improve readability and TorchScript clarity.
+- Lowered the scripted streaming `block_size` to 256 samples (configurable) to minimize nn~ latency.
 
 ## Usage notes
 - Training entrypoint is `training()` in `main.py`; it expects a CSV listing audio files (see `CSV_PATH`, `CLIPS_DIR`).

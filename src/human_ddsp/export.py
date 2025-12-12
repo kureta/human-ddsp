@@ -11,7 +11,7 @@ from human_ddsp import main
 
 
 class ScriptedDDSP(Module):
-    def __init__(self, pretrained: main.VoiceAutoEncoder):
+    def __init__(self, pretrained: main.VoiceAutoEncoder, block_size: int = 256):
         super().__init__()
 
         self.model = pretrained
@@ -19,7 +19,7 @@ class ScriptedDDSP(Module):
 
         # 1. Configuration
         self.sr = 48000
-        self.block_size = 1024
+        self.block_size = block_size
         self.n_fft = 1024
 
         # 2. Register Attributes
@@ -108,11 +108,11 @@ class ScriptedDDSP(Module):
     def apply_filter_single_frame(
         self, excitation: torch.Tensor, filter_curve: torch.Tensor
     ) -> torch.Tensor:
-        """Applies spectral filter to a 1024-sample block."""
-        # excitation: [Batch, 1024, 1]
+        """Applies spectral filter to a block_size-sample block."""
+        # excitation: [Batch, block_size, 1]
         ex_t = excitation.transpose(1, 2)
 
-        # Standard RFFT (1024 -> 513 bins)
+        # Standard RFFT (n_fft -> n_fft/2+1 bins)
         spec = torch.fft.rfft(ex_t, n=self.n_fft)
 
         curve_interp = F.interpolate(
@@ -130,8 +130,8 @@ class ScriptedDDSP(Module):
 
     def process_block(self, x_chunk: torch.Tensor) -> torch.Tensor:
         """
-        Processes exactly one block of 1024 samples.
-        x_chunk: [Batch, 4, 1024]
+        Processes exactly one block of `block_size` samples.
+        x_chunk: [Batch, 4, block_size]
         """
         # 1. Unpack
         audio = x_chunk[:, 0:1, :]
@@ -139,7 +139,7 @@ class ScriptedDDSP(Module):
         gen_val = x_chunk[:, 2, :].mean(dim=-1)
         age_val = x_chunk[:, 3, :].mean(dim=-1)
 
-        # 2. Encoder Analysis (On 1024 samples)
+        # 2. Encoder Analysis (On block_size samples)
         window = audio.squeeze(1)
 
         # Take LAST frame features
@@ -164,7 +164,7 @@ class ScriptedDDSP(Module):
         controls = self.model.controller(f0_shifted, loud_enc, z, g_tensor, a_tensor)
 
         # 6. Synthesis
-        # Expand to 1024 (self.block_size)
+        # Expand to block_size (self.block_size)
         f0_up = f0_shifted.expand(-1, self.block_size, -1)
         amp_up = controls["amplitude"].expand(-1, self.block_size, -1)
         oq_up = controls["open_quotient"].expand(-1, self.block_size, -1)
@@ -186,7 +186,7 @@ class ScriptedDDSP(Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Input x: [Batch, 4, Time]
-        Handles arbitrary buffer sizes by splitting into 1024-sample chunks.
+        Handles arbitrary buffer sizes by splitting into block_size chunks.
         Inference-only: gradients are disabled for streaming export.
         """
         with torch.no_grad():
@@ -205,20 +205,19 @@ class ScriptedDDSP(Module):
                 self.phase_accum.data.resize_(current_batch, 1, 1)
             self.phase_accum.data.zero_()
 
-            # Split into chunks of 1024
-            # If x is 8192, we get 8 chunks.
+            # Split into chunks of block_size
             chunks = torch.split(x, self.block_size, dim=-1)
 
             outputs = []
             for chunk in chunks:
-                # Only process if chunk is full size (1024)
-                # nn_tilde check sends 8192, so all chunks are 1024.
+                # Only process if chunk is full size (block_size)
+                # nn_tilde should deliver exact multiples of block_size.
                 if chunk.shape[-1] == self.block_size:
                     out_chunk = self.process_block(chunk)
                     outputs.append(out_chunk)
                 else:
                     # Fallback for partial chunks (silence or just skip)
-                    # Max/MSP should be configured to 1024 block size, so this shouldn't happen often.
+                    # Max/MSP should be configured to block_size, so this shouldn't happen often.
                     outputs.append(
                         torch.zeros(current_batch, 1, chunk.shape[-1], device=target_device)
                     )
