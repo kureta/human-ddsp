@@ -196,7 +196,8 @@ class AudioFeatureEncoder(nn.Module):
 
     def get_pitch(self, audio):
         pad = self.n_fft // 2
-        audio_pad = F.pad(audio.unsqueeze(1), (pad, pad), mode="reflect").squeeze(1)
+        pad_mode = "reflect" if audio.shape[-1] >= 2 * pad else "constant"
+        audio_pad = F.pad(audio.unsqueeze(1), (pad, pad), mode=pad_mode).squeeze(1)
         frames = audio_pad.unfold(dimension=-1, size=self.n_fft, step=self.hop_length)
 
         n_fft_corr = 2 * self.n_fft
