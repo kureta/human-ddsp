@@ -150,17 +150,10 @@ class LearnableReverb(nn.Module):
             x = audio
 
         batch, channels, dry_len = x.shape
-        fft_size = dry_len + self.impulse_response.shape[-1] - 1
+        fft_size = max(1, int(dry_len + self.impulse_response.shape[-1] - 1))
 
-        # --- FIX: Use Torch operations instead of Python math ---
-        # 1. Cast size to float tensor for log2
-        size_tensor = torch.tensor(float(fft_size))
-
-        # 2. Calculate next power of 2 using torch functions
-        # 2 ^ ceil(log2(size))
-        n_fft_pow = torch.ceil(torch.log2(size_tensor))
-        n_fft = int(2 ** n_fft_pow.item())
-        # ------------------------------------------------------
+        # Use a python-side next power of two to stay device agnostic and scriptable
+        n_fft = 1 << (fft_size - 1).bit_length()
 
         dry_fft = torch.fft.rfft(x, n=n_fft, dim=-1)
         ir_fft = torch.fft.rfft(self.impulse_response, n=n_fft, dim=-1)
@@ -439,14 +432,14 @@ class CsvAudioDataset(Dataset):
 
 
 def convert_voice(
-    model,
-    input_wav,
-    output_wav,
-    target_gender_balance,
-    target_age,
-    pitch_shift=0.0,
-    device="cpu",
-):
+    model: VoiceAutoEncoder,
+    input_wav: str,
+    output_wav: str,
+    target_gender_balance: float,
+    target_age: float,
+    pitch_shift: float = 0.0,
+    device: str = "cpu",
+) -> None:
     audio, sr = torchaudio.load(input_wav)
     if audio.shape[0] > 1:
         audio = torch.mean(audio, dim=0, keepdim=True)
@@ -490,7 +483,7 @@ def convert_voice(
     print(f"Saved: {output_wav}")
 
 
-def process_tsv(file_path, output_path):
+def process_tsv(file_path: str, output_path: str) -> None:
     # 1. Load the TSV file
     # Polars uses read_csv with a separator argument for TSV
     df = pl.read_csv(

@@ -34,6 +34,9 @@ class ScriptedDDSP(Module):
         # 3. STATE BUFFERS
         self.register_buffer("rnn_state", torch.zeros(1, 1, 256))
         self.register_buffer("phase_accum", torch.zeros(1, 1, 1))
+        self.register_buffer(
+            "block_window", torch.hann_window(self.block_size, device=torch.device("cpu"))
+        )
 
         # 4. Register Method
         self.register_method(
@@ -76,7 +79,9 @@ class ScriptedDDSP(Module):
 
     # -------------------------
 
-    def stateful_rosenberg(self, f0, open_quotient):
+    def stateful_rosenberg(
+        self, f0: torch.Tensor, open_quotient: torch.Tensor
+    ) -> torch.Tensor:
         """Streaming Rosenberg source with phase tracking."""
         phase_step = f0 / self.sr
         phase_block = torch.cumsum(phase_step, dim=1)
@@ -100,7 +105,9 @@ class ScriptedDDSP(Module):
 
         return diff_wave
 
-    def apply_filter_single_frame(self, excitation, filter_curve):
+    def apply_filter_single_frame(
+        self, excitation: torch.Tensor, filter_curve: torch.Tensor
+    ) -> torch.Tensor:
         """Applies spectral filter to a 1024-sample block."""
         # excitation: [Batch, 1024, 1]
         ex_t = excitation.transpose(1, 2)
@@ -116,12 +123,12 @@ class ScriptedDDSP(Module):
         audio = torch.fft.irfft(filtered_spec, n=self.n_fft)
 
         # Windowing to smooth block boundaries
-        window = torch.hann_window(self.block_size, device=audio.device)
+        window = self.block_window.to(audio.device)
         audio = audio * window
 
         return audio.transpose(1, 2)
 
-    def process_block(self, x_chunk):
+    def process_block(self, x_chunk: torch.Tensor) -> torch.Tensor:
         """
         Processes exactly one block of 1024 samples.
         x_chunk: [Batch, 4, 1024]
@@ -176,38 +183,48 @@ class ScriptedDDSP(Module):
         mix = (voiced_audio + unvoiced_audio) * amp_up
         return mix.transpose(1, 2)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Input x: [Batch, 4, Time]
         Handles arbitrary buffer sizes by splitting into 1024-sample chunks.
+        Inference-only: gradients are disabled for streaming export.
         """
-        # Check Batch Size & Resize States
-        current_batch = x.shape[0]
-        if self.rnn_state.shape[1] != current_batch:
-            self.rnn_state = torch.zeros(1, current_batch, 256, device=x.device)
-        if self.phase_accum.shape[0] != current_batch:
-            self.phase_accum = torch.zeros(current_batch, 1, 1, device=x.device)
+        with torch.no_grad():
+            # Check Batch Size & Resize States
+            current_batch = x.shape[0]
+            target_device = x.device
+            if self.rnn_state.device != target_device:
+                self.rnn_state = self.rnn_state.to(target_device)
+            if self.rnn_state.shape[1] != current_batch:
+                self.rnn_state.data.resize_(1, current_batch, 256)
+            self.rnn_state.data.zero_()
 
-        # Split into chunks of 1024
-        # If x is 8192, we get 8 chunks.
-        chunks = torch.split(x, self.block_size, dim=-1)
+            if self.phase_accum.device != target_device:
+                self.phase_accum = self.phase_accum.to(target_device)
+            if self.phase_accum.shape[0] != current_batch:
+                self.phase_accum.data.resize_(current_batch, 1, 1)
+            self.phase_accum.data.zero_()
 
-        outputs = []
-        for chunk in chunks:
-            # Only process if chunk is full size (1024)
-            # nn_tilde check sends 8192, so all chunks are 1024.
-            if chunk.shape[-1] == self.block_size:
-                out_chunk = self.process_block(chunk)
-                outputs.append(out_chunk)
-            else:
-                # Fallback for partial chunks (silence or just skip)
-                # Max/MSP should be configured to 1024 block size, so this shouldn't happen often.
-                outputs.append(
-                    torch.zeros(current_batch, 1, chunk.shape[-1], device=x.device)
-                )
+            # Split into chunks of 1024
+            # If x is 8192, we get 8 chunks.
+            chunks = torch.split(x, self.block_size, dim=-1)
 
-        # Concatenate back
-        return torch.cat(outputs, dim=-1)
+            outputs = []
+            for chunk in chunks:
+                # Only process if chunk is full size (1024)
+                # nn_tilde check sends 8192, so all chunks are 1024.
+                if chunk.shape[-1] == self.block_size:
+                    out_chunk = self.process_block(chunk)
+                    outputs.append(out_chunk)
+                else:
+                    # Fallback for partial chunks (silence or just skip)
+                    # Max/MSP should be configured to 1024 block size, so this shouldn't happen often.
+                    outputs.append(
+                        torch.zeros(current_batch, 1, chunk.shape[-1], device=target_device)
+                    )
+
+            # Concatenate back
+            return torch.cat(outputs, dim=-1)
 
 
 def main_export():
