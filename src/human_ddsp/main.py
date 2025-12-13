@@ -297,12 +297,8 @@ class VoiceController(nn.Module):
         f0_norm = (torch.log(f0 + 1e-5) - 4.0) / 4.0
         loudness_norm = (loudness_db / 100.0) + 1.0
 
-        frames = f0.shape[1]
-        gender_bc = gender.view(-1, 1, 2).expand(-1, frames, -1)
-        age_bc = age.view(-1, 1, 1).expand(-1, frames, -1)
-
         decoder_input = torch.cat(
-            [z, f0_norm, loudness_norm, gender_bc, age_bc], dim=-1
+            [z, f0_norm, loudness_norm, gender, age], dim=-1
         )
         hidden = self.mlp(decoder_input)
 
@@ -325,7 +321,12 @@ class VoiceAutoEncoder(nn.Module):
 
     def forward(self, audio, gender, age):
         f0, loud_db, z = self.encoder(audio)
-        controls = self.controller(f0, loud_db, z, gender, age)
+
+        frames = f0.shape[1]
+        gender_bc = gender.view(-1, 1, 2).expand(-1, frames, -1)
+        age_bc = age.view(-1, 1, 1).expand(-1, frames, -1)
+
+        controls = self.controller(f0, loud_db, z, gender_bc, age_bc)
         dry_audio = self.decoder(
             f0=controls["f0"],
             amplitude=controls["amplitude"],
@@ -418,14 +419,18 @@ class MultiScaleMelLoss(nn.Module):
             f_max = sample_rate / 2.0
 
         if not (0.0 <= f_min < f_max):
-            raise ValueError(f"Expected 0 <= f_min < f_max, got f_min={f_min}, f_max={f_max}")
+            raise ValueError(
+                f"Expected 0 <= f_min < f_max, got f_min={f_min}, f_max={f_max}"
+            )
 
         # Allow a single int or a list per scale
         if isinstance(n_mels, int):
             n_mels_list = [n_mels for _ in range(len(fft_sizes))]
         else:
             n_mels_list = n_mels
-            assert len(n_mels_list) == len(fft_sizes), "n_mels list must match fft_sizes length"
+            assert len(n_mels_list) == len(
+                fft_sizes
+            ), "n_mels list must match fft_sizes length"
 
         self.mel_weight = mel_weight
         self.log_mel_weight = log_mel_weight
