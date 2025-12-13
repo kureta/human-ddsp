@@ -413,6 +413,13 @@ class MultiScaleMelLoss(nn.Module):
         if fft_sizes is None:
             fft_sizes = [2048, 1024, 512, 256]
 
+        # Ensure f_max is consistent with Nyquist
+        if f_max is None:
+            f_max = sample_rate / 2.0
+
+        if not (0.0 <= f_min < f_max):
+            raise ValueError(f"Expected 0 <= f_min < f_max, got f_min={f_min}, f_max={f_max}")
+
         # Allow a single int or a list per scale
         if isinstance(n_mels, int):
             n_mels_list = [n_mels for _ in range(len(fft_sizes))]
@@ -427,6 +434,11 @@ class MultiScaleMelLoss(nn.Module):
         self.transforms = nn.ModuleList()
         for n_fft, nm in zip(fft_sizes, n_mels_list):
             hop_length = max(1, int(n_fft * hop_ratio))
+
+            # Clamp n_mels to something the FFT grid can actually support
+            n_freqs = n_fft // 2 + 1
+            nm_safe = int(min(nm, n_freqs - 1))
+
             self.transforms.append(
                 T.MelSpectrogram(
                     sample_rate=sample_rate,
@@ -434,7 +446,7 @@ class MultiScaleMelLoss(nn.Module):
                     hop_length=hop_length,
                     win_length=n_fft,
                     window_fn=torch.hann_window,
-                    n_mels=nm,
+                    n_mels=nm_safe,
                     f_min=f_min,
                     f_max=f_max,
                     power=power,
@@ -637,7 +649,7 @@ if torch.cuda.is_available():
 # elif torch.backends.mps.is_available():
 #     DEVICE = "mps"
 
-SAMPLE_RATE = 48000
+SAMPLE_RATE = 16000
 N_EPOCHS = 100
 
 # Restored Variables
@@ -660,7 +672,11 @@ def training():
 
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     # criterion = MultiScaleSpectralLoss().to(DEVICE)
-    criterion = MultiScaleMelLoss().to(DEVICE)
+    criterion = MultiScaleMelLoss(
+        sample_rate=SAMPLE_RATE,
+        fft_sizes=[2048, 1024, 512, 256],
+        n_mels=[80, 80, 64, 40],
+    ).to(DEVICE)
 
     print(f"Starting Training on {DEVICE}...")
     print(f"Dataset Size: {len(dataset)} | Batch Size: {BATCH_SIZE}")
@@ -740,17 +756,17 @@ def inference():
             INPUT_WAV,
             "generated/output_female.wav",
             1.0,
-            0.40,
-            pitch_shift=9.0,
+            0.4,
+            pitch_shift=7.0,
             device=DEVICE,
         )
         convert_voice(
             model,
             INPUT_WAV,
-            "generated/output_old_male.wav",
-            1.0,
-            0.1,
-            pitch_shift=12.0,
+            "generated/output_male.wav",
+            0.0,
+            0.4,
+            pitch_shift=-7.0,
             device=DEVICE,
         )
     else:
