@@ -21,6 +21,57 @@ except ImportError:
 
 
 # ==========================================
+# Age Config & Utilities
+# ==========================================
+
+AGE_LABELS = [
+    "teens",
+    "twenties",
+    "thirties",
+    "fourties",
+    "fifties",
+    "sixties",
+    "seventies",
+    "eighties",
+]
+NUM_AGE_CLASSES = len(AGE_LABELS)
+
+
+def float_to_weighted_age(age_float: float, device="cpu"):
+    """
+    Maps a float (0.0 to 1.0) to a weighted one-hot vector across AGE_LABELS.
+
+    0.0 -> 100% 'teens'
+    1.0 -> 100% 'eighties'
+    Values in between interpolate linearly between the two nearest neighbors.
+    """
+    # Clamp to 0-1
+    val = max(0.0, min(1.0, age_float))
+
+    # Map 0.0-1.0 to continuous index range 0.0 to (N-1).0
+    max_idx = NUM_AGE_CLASSES - 1
+    continuous_idx = val * max_idx
+
+    # Find lower and upper integer indices
+    idx_lower = int(continuous_idx)
+    idx_upper = min(idx_lower + 1, max_idx)
+
+    # Calculate weight (distance from lower)
+    alpha = continuous_idx - idx_lower
+
+    # Create vector
+    vector = torch.zeros(NUM_AGE_CLASSES, device=device)
+
+    if idx_lower == idx_upper:
+        vector[idx_lower] = 1.0
+    else:
+        vector[idx_lower] = 1.0 - alpha
+        vector[idx_upper] = alpha
+
+    return vector
+
+
+# ==========================================
 # 1. DSP & Helper Modules
 # ==========================================
 
@@ -278,8 +329,8 @@ class AudioFeatureEncoder(nn.Module):
 class VoiceController(nn.Module):
     def __init__(self, z_dim=16, n_filter_bins=65, hidden_dim=512, n_layers=3):
         super().__init__()
-        # z(64) + f0(1) + loud(1) + gender(2) + age(1) = 69
-        input_dim = z_dim + 5
+        # z(16) + f0(1) + loud(1) + gender(2) + age(NUM_AGE_CLASSES)
+        input_dim = z_dim + 4 + NUM_AGE_CLASSES
 
         layers = []
         for i in range(n_layers):
@@ -294,12 +345,14 @@ class VoiceController(nn.Module):
         self.proj_nf = nn.Linear(hidden_dim, n_filter_bins)
 
     def forward(self, f0, loudness_db, z, gender, age):
+        # f0, loudness: [Batch, Time, 1]
+        # gender:       [Batch, Time, 2]
+        # age:          [Batch, Time, NUM_AGE_CLASSES]
+
         f0_norm = (torch.log(f0 + 1e-5) - 4.0) / 4.0
         loudness_norm = (loudness_db / 100.0) + 1.0
 
-        decoder_input = torch.cat(
-            [z, f0_norm, loudness_norm, gender, age], dim=-1
-        )
+        decoder_input = torch.cat([z, f0_norm, loudness_norm, gender, age], dim=-1)
         hidden = self.mlp(decoder_input)
 
         return {
@@ -315,16 +368,23 @@ class VoiceAutoEncoder(nn.Module):
     def __init__(self, sample_rate=16000):
         super().__init__()
         self.encoder = AudioFeatureEncoder(sample_rate=sample_rate, z_dim=16)
+        # Ensure VoiceController matches the new dimensions
         self.controller = VoiceController(z_dim=16, n_filter_bins=65)
         self.decoder = NeuralVoiceDecoder(sample_rate=sample_rate, n_filter_bins=65)
         self.reverb = LearnableReverb(sample_rate=sample_rate, reverb_duration=0.5)
 
     def forward(self, audio, gender, age):
+        # age shape expected: [Batch, NUM_AGE_CLASSES]
         f0, loud_db, z = self.encoder(audio)
 
         frames = f0.shape[1]
-        gender_bc = gender.view(-1, 1, 2).expand(-1, frames, -1)
-        age_bc = age.view(-1, 1, 1).expand(-1, frames, -1)
+
+        # Broadcast static attributes to time axis
+        # gender: [Batch, 2] -> [Batch, Time, 2]
+        gender_bc = gender.unsqueeze(1).expand(-1, frames, -1)
+
+        # age: [Batch, Classes] -> [Batch, Time, Classes]
+        age_bc = age.unsqueeze(1).expand(-1, frames, -1)
 
         controls = self.controller(f0, loud_db, z, gender_bc, age_bc)
         dry_audio = self.decoder(
@@ -505,16 +565,8 @@ class CsvAudioDataset(Dataset):
         else:
             self.data = df
 
-        self.age_map = {
-            "teens": 0.16,
-            "twenties": 0.25,
-            "thirties": 0.35,
-            "fourties": 0.45,
-            "fifties": 0.55,
-            "sixties": 0.65,
-            "seventies": 0.75,
-            "eighties": 0.85,
-        }
+        # Pre-compute class indices map
+        self.age_to_idx = {label: i for i, label in enumerate(AGE_LABELS)}
 
     def __len__(self):
         return len(self.data) * 50
@@ -536,13 +588,20 @@ class CsvAudioDataset(Dataset):
         else:
             chunk = F.pad(audio[0], (0, self.chunk_size - audio.shape[-1]))
 
-        age_val = self.age_map.get(row["age"], 0.30)
+        # --- Age Processing ---
+        age_label = row["age"]
+        age_idx = self.age_to_idx.get(
+            age_label, self.age_to_idx["thirties"]
+        )  # Default to 30s
+        age_vec = F.one_hot(torch.tensor(age_idx), num_classes=NUM_AGE_CLASSES).float()
+
+        # --- Gender Processing ---
         gender_vec = (
             torch.tensor([0.0, 1.0])
             if "female" in row["gender"]
             else torch.tensor([1.0, 0.0])
         )
-        return chunk, gender_vec.float(), torch.tensor(age_val).float()
+        return chunk, gender_vec, age_vec
 
 
 # ==========================================
@@ -555,7 +614,7 @@ def convert_voice(
     input_wav,
     output_wav,
     target_gender_balance,
-    target_age,
+    target_age_float,  # Changed param name to clarify it's a float 0.0-1.0
     pitch_shift=0.0,
     device="cpu",
 ):
@@ -570,19 +629,27 @@ def convert_voice(
 
     model.eval()
     with torch.no_grad():
-        # 1. Extract All Features (Fixed: z was missing in your version)
+        # 1. Extract Features
         f0, loud_db, z = model.encoder(audio)
 
         # 2. Pitch Shift
-        f0 = f0 * (2 ** (pitch_shift / 12.0))
+        if pitch_shift != 0.0:
+            f0 = f0 * (2 ** (pitch_shift / 12.0))
 
-        # 3. Conditions
+        # 3. Create Condition Tensors
+        frames = f0.shape[1]
+
+        # Gender
         gm = 1.0 - target_gender_balance
         gf = target_gender_balance
-        g_tensor = torch.tensor([[gm, gf]], device=device).float()
-        a_tensor = torch.tensor([target_age], device=device).float()
+        g_vec = torch.tensor([gm, gf], device=device).float()
+        g_tensor = g_vec.view(1, 1, 2).expand(1, frames, -1)
 
-        # 4. Controller (Fixed: passed z)
+        # Age (Using weighted utility)
+        a_vec = float_to_weighted_age(target_age_float, device=device)
+        a_tensor = a_vec.view(1, 1, -1).expand(1, frames, -1)
+
+        # 4. Controller
         controls = model.controller(f0, loud_db, z, g_tensor, a_tensor)
 
         # 5. Decode
