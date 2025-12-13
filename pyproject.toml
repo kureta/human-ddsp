@@ -15,6 +15,7 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
+  "librosa>=0.11.0",
   "nn-tilde>=1.5.6",
   "numpy>=2.3.5",
   "polars>=1.36.1",
