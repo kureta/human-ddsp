@@ -802,10 +802,11 @@ def training():
                     out = wet[ridx].cpu().numpy()
 
                     g_str = "Fem" if gender[ridx, 0].item() < 0.5 else "Male"
-                    a_val = age[ridx].item()
+                    age_idx = torch.argmax(age[ridx]).item()
+                    age_str = AGE_LABELS[age_idx]
 
                     fname_base = (
-                        f"{CHECKPOINT_DIR}/step{num_batches}_{g_str}_Age{a_val:.2f}"
+                        f"{CHECKPOINT_DIR}/step{num_batches}_{g_str}_{age_str}"
                     )
                     scipy.io.wavfile.write(f"{fname_base}_target.wav", SAMPLE_RATE, tgt)
                     scipy.io.wavfile.write(f"{fname_base}_recon.wav", SAMPLE_RATE, out)
