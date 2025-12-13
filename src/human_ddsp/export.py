@@ -216,7 +216,7 @@ def main_export():
 
     if os.path.exists(checkpoint_path):
         print(f"Loading {checkpoint_path}...")
-        base_model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
+        base_model.load_state_dict(torch.load(checkpoint_path, map_location="cpu", weights_only=True))
 
     scripted_model = ScriptedDDSP(base_model)
     scripted_model.export_to_ts("ddsp_voice.ts")

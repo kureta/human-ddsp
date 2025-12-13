@@ -250,6 +250,8 @@ class AudioFeatureEncoder(nn.Module):
         rnn_out, _ = self.rnn(mels)
         z = self.projection(rnn_out)  # [Batch, Time, z_dim]
 
+        return z
+
         # --- Temporal Bottleneck ---
         # 1. Downsample (Average Pool)
         # Transpose to [Batch, Feat, Time] for pooling
