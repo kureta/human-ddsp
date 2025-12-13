@@ -374,6 +374,99 @@ class MultiScaleSpectralLoss(nn.Module):
         return loss
 
 
+class MultiScaleMelLoss(nn.Module):
+    """
+    Multi‑scale mel‑spectrogram loss.
+
+    Computes L1 distance between mel and log‑mel magnitudes across multiple
+    STFT configurations. Designed as a drop‑in alternative to
+    `MultiScaleSpectralLoss`.
+
+    Args:
+        sample_rate: Audio sample rate.
+        fft_sizes: List of FFT sizes to use for the multi‑scale mel features.
+        n_mels: Number of mel bands for each scale (int or list matching fft_sizes).
+        mel_weight: Weight for linear mel magnitude term.
+        log_mel_weight: Weight for log mel magnitude term.
+        hop_ratio: Hop length as a ratio of n_fft (e.g., 0.25 means 25%).
+        power: Power for magnitude in MelSpectrogram (1.0 -> magnitude, 2.0 -> power).
+        f_min: Minimum frequency for mel filter bank.
+        f_max: Maximum frequency for mel filter bank (None -> Nyquist).
+        norm: Mel scale normalization (passed to torchaudio MelSpectrogram).
+    """
+
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        fft_sizes=None,
+        n_mels=80,
+        mel_weight: float = 1.0,
+        log_mel_weight: float = 1.0,
+        hop_ratio: float = 0.25,
+        power: float = 1.0,
+        f_min: float = 0.0,
+        f_max: float | None = None,
+        norm: str | None = "slaney",
+    ):
+        super().__init__()
+
+        if fft_sizes is None:
+            fft_sizes = [2048, 1024, 512, 256]
+
+        # Allow a single int or a list per scale
+        if isinstance(n_mels, int):
+            n_mels_list = [n_mels for _ in range(len(fft_sizes))]
+        else:
+            n_mels_list = n_mels
+            assert len(n_mels_list) == len(fft_sizes), "n_mels list must match fft_sizes length"
+
+        self.mel_weight = mel_weight
+        self.log_mel_weight = log_mel_weight
+
+        # Build per‑scale MelSpectrogram transforms
+        self.transforms = nn.ModuleList()
+        for n_fft, nm in zip(fft_sizes, n_mels_list):
+            hop_length = max(1, int(n_fft * hop_ratio))
+            self.transforms.append(
+                T.MelSpectrogram(
+                    sample_rate=sample_rate,
+                    n_fft=n_fft,
+                    hop_length=hop_length,
+                    win_length=n_fft,
+                    window_fn=torch.hann_window,
+                    n_mels=nm,
+                    f_min=f_min,
+                    f_max=f_max,
+                    power=power,
+                    normalized=False,
+                    norm=norm,
+                    center=True,
+                    pad_mode="reflect",
+                )
+            )
+
+    def forward(self, x_pred: torch.Tensor, x_target: torch.Tensor):
+        # Ensure shape is (B, T)
+        if x_pred.dim() == 1:
+            x_pred = x_pred.unsqueeze(0)
+        if x_target.dim() == 1:
+            x_target = x_target.unsqueeze(0)
+
+        loss = 0.0
+        eps = 1e-7
+        for mel in self.transforms:
+            mel_pred = mel(x_pred)
+            mel_tgt = mel(x_target)
+
+            # Use L1 on mel and log‑mel
+            loss = loss + self.mel_weight * F.l1_loss(mel_pred, mel_tgt)
+            loss = loss + self.log_mel_weight * F.l1_loss(
+                torch.log(mel_pred.clamp_min(eps)), torch.log(mel_tgt.clamp_min(eps))
+            )
+
+        return loss
+
+
 # ==========================================
 # 3. Data Loading
 # ==========================================
@@ -565,7 +658,8 @@ def training():
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
 
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    criterion = MultiScaleSpectralLoss().to(DEVICE)
+    # criterion = MultiScaleSpectralLoss().to(DEVICE)
+    criterion = MultiScaleMelLoss().to(DEVICE)
 
     print(f"Starting Training on {DEVICE}...")
     print(f"Dataset Size: {len(dataset)} | Batch Size: {BATCH_SIZE}")
