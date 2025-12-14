@@ -107,7 +107,10 @@ class NeuralVoiceDecoder(nn.Module):
         return F.pad(diff_wave, (1, 0))
 
     def apply_filter(self, excitation, filter_magnitudes):
-        # 1. STFT
+        # excitation: [Batch, Length]
+        # filter_magnitudes: [Batch, Time, n_filter_bins]
+
+        # 1. STFT of Excitation
         ex_stft = torch.stft(
             excitation,
             self.n_fft,
@@ -116,24 +119,26 @@ class NeuralVoiceDecoder(nn.Module):
             window=self.window,
             center=True,
             return_complex=True,
-        )
+        ) # [Batch, FreqBins, TimeSteps]
 
-        # 2. Interpolate Filter
-        filter_mod = filter_magnitudes.transpose(1, 2)
-        # Interpolate from n_filter_bins (65) to FFT bins (e.g. 1025)
+        # 2. Interpolate Filter (Frequency-axis only)
+        B, T, F_ctrl = filter_magnitudes.shape
+        F_target = ex_stft.shape[1] # FreqBins, e.g., 1025
+
+        # Reshape to [B * T, 1, F_ctrl] to interpolate along the last (frequency) dimension
+        filter_reshaped = filter_magnitudes.reshape(B * T, 1, F_ctrl) 
+        
         filter_resized = F.interpolate(
-            filter_mod, size=ex_stft.shape[2], mode="linear", align_corners=False
-        )
-        target_bins = ex_stft.shape[1]
-        filter_final = F.interpolate(
-            filter_resized.transpose(1, 2),
-            size=target_bins,
-            mode="linear",
-            align_corners=False,
-        ).transpose(1, 2)
+            filter_reshaped, size=F_target, mode="linear", align_corners=False
+        ) # [B * T, 1, F_target]
 
+        # Reshape and transpose back to match STFT shape: [B, F_target, T]
+        filter_final = filter_resized.squeeze(1).reshape(B, T, F_target).transpose(1, 2)
+        
         # 3. Filter
-        output_stft = ex_stft * filter_final.type_as(ex_stft)
+        # Note: No need to explicitly call .type_as() if the complex-valued STFT
+        # is correctly handled by broadcasting with the real-valued filter.
+        output_stft = ex_stft * filter_final
 
         # 4. iSTFT
         output_audio = torch.istft(
