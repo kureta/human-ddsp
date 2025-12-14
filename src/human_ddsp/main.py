@@ -40,26 +40,16 @@ NUM_AGE_CLASSES = len(AGE_LABELS)
 def float_to_weighted_age(age_float: float, device="cpu"):
     """
     Maps a float (0.0 to 1.0) to a weighted one-hot vector across AGE_LABELS.
-
-    0.0 -> 100% 'teens'
-    1.0 -> 100% 'eighties'
-    Values in between interpolate linearly between the two nearest neighbors.
     """
-    # Clamp to 0-1
     val = max(0.0, min(1.0, age_float))
-
-    # Map 0.0-1.0 to continuous index range 0.0 to (N-1).0
     max_idx = NUM_AGE_CLASSES - 1
     continuous_idx = val * max_idx
 
-    # Find lower and upper integer indices
     idx_lower = int(continuous_idx)
     idx_upper = min(idx_lower + 1, max_idx)
 
-    # Calculate weight (distance from lower)
     alpha = continuous_idx - idx_lower
 
-    # Create vector
     vector = torch.zeros(NUM_AGE_CLASSES, device=device)
 
     if idx_lower == idx_upper:
@@ -92,7 +82,7 @@ def _create_a_weighting(n_fft, sr):
 
 
 class NeuralVoiceDecoder(nn.Module):
-    def __init__(self, sample_rate=16000, n_fft=1024, hop_length=256, n_filter_bins=65):
+    def __init__(self, sample_rate, n_fft, hop_length, n_filter_bins=65):
         super().__init__()
         self.sample_rate = sample_rate
         self.n_fft = n_fft
@@ -130,6 +120,7 @@ class NeuralVoiceDecoder(nn.Module):
 
         # 2. Interpolate Filter
         filter_mod = filter_magnitudes.transpose(1, 2)
+        # Interpolate from n_filter_bins (65) to FFT bins (e.g. 1025)
         filter_resized = F.interpolate(
             filter_mod, size=ex_stft.shape[2], mode="linear", align_corners=False
         )
@@ -185,7 +176,7 @@ class NeuralVoiceDecoder(nn.Module):
 
 
 class LearnableReverb(nn.Module):
-    def __init__(self, sample_rate=16000, reverb_duration=1.0):
+    def __init__(self, sample_rate, reverb_duration=1.0):
         super().__init__()
         self.sample_rate = sample_rate
         n_samples = int(sample_rate * reverb_duration)
@@ -203,15 +194,9 @@ class LearnableReverb(nn.Module):
         batch, channels, dry_len = x.shape
         fft_size = dry_len + self.impulse_response.shape[-1] - 1
 
-        # --- FIX: Use Torch operations instead of Python math ---
-        # 1. Cast size to float tensor for log2
         size_tensor = torch.tensor(float(fft_size))
-
-        # 2. Calculate next power of 2 using torch functions
-        # 2 ^ ceil(log2(size))
         n_fft_pow = torch.ceil(torch.log2(size_tensor))
         n_fft = int(2 ** n_fft_pow.item())
-        # ------------------------------------------------------
 
         dry_fft = torch.fft.rfft(x, n=n_fft, dim=-1)
         ir_fft = torch.fft.rfft(self.impulse_response, n=n_fft, dim=-1)
@@ -228,10 +213,10 @@ class LearnableReverb(nn.Module):
 class AudioFeatureEncoder(nn.Module):
     def __init__(
         self,
-        sample_rate=16000,
-        n_fft=1024,
-        hop_length=256,
-        n_mels=80,
+        sample_rate,
+        n_fft,
+        hop_length,
+        n_mels,
         z_dim=16,
         gru_units=256,
     ):
@@ -295,26 +280,12 @@ class AudioFeatureEncoder(nn.Module):
 
     def get_content_from_mels(self, mels):
         """
-        Runs RNN on Mels and applies Temporal Bottleneck.
+        Runs RNN on Mels.
         Expected mels shape: [Batch, Time, Mels]
         """
         rnn_out, _ = self.rnn(mels)
         z = self.projection(rnn_out)  # [Batch, Time, z_dim]
-
         return z
-
-        # --- Temporal Bottleneck ---
-        # 1. Downsample (Average Pool)
-        # Transpose to [Batch, Feat, Time] for pooling
-        z_t = z.transpose(1, 2)
-        z_down = F.avg_pool1d(z_t, kernel_size=4, stride=4)
-
-        # 2. Upsample (Linear Interpolation)
-        z_up = F.interpolate(
-            z_down, size=z.shape[1], mode="linear", align_corners=False
-        )
-
-        return z_up.transpose(1, 2)
 
     def forward(self, audio):
         f0 = self.get_pitch(audio)
@@ -327,7 +298,7 @@ class AudioFeatureEncoder(nn.Module):
 
 
 class VoiceController(nn.Module):
-    def __init__(self, z_dim=16, n_filter_bins=65, hidden_dim=512, n_layers=3):
+    def __init__(self, z_dim, n_filter_bins, hidden_dim=512, n_layers=3):
         super().__init__()
         # z(16) + f0(1) + loud(1) + gender(2) + age(NUM_AGE_CLASSES)
         input_dim = z_dim + 4 + NUM_AGE_CLASSES
@@ -349,10 +320,28 @@ class VoiceController(nn.Module):
         # gender:       [Batch, Time, 2]
         # age:          [Batch, Time, NUM_AGE_CLASSES]
 
-        f0_norm = (torch.log(f0 + 1e-5) - 4.0) / 4.0
-        loudness_norm = (loudness_db / 100.0) + 1.0
+        # --- DECOUPLING LOGIC ---
+        # 1. Log Pitch
+        f0_log = torch.log(f0 + 1e-5)
 
-        decoder_input = torch.cat([z, f0_norm, loudness_norm, gender, age], dim=-1)
+        # 2. Instance Normalization (The Fix)
+        # We calculate the mean pitch for THIS specific audio clip.
+        f0_mean = torch.mean(f0_log, dim=1, keepdim=True)
+        f0_relative = f0_log - f0_mean
+
+        # Optional: Normalize Loudness too (removes recording gain differences)
+        loudness_mean = torch.mean(loudness_db, dim=1, keepdim=True)
+        loudness_relative = loudness_db - loudness_mean
+
+        # ------------------------
+
+        # Use RELATIVE pitch/loudness for the controller inputs
+        # (We multiply by constants just to keep values roughly in -1 to 1 range)
+        decoder_input = torch.cat(
+            [z, f0_relative * 2.0, loudness_relative / 20.0, gender, age],
+            dim=-1,
+        )
+
         hidden = self.mlp(decoder_input)
 
         return {
@@ -365,12 +354,30 @@ class VoiceController(nn.Module):
 
 
 class VoiceAutoEncoder(nn.Module):
-    def __init__(self, sample_rate=16000):
+    def __init__(
+        self,
+        sample_rate,
+        n_fft,
+        hop_length,
+        n_mels,
+        z_dim=16,
+        n_filter_bins=65,
+    ):
         super().__init__()
-        self.encoder = AudioFeatureEncoder(sample_rate=sample_rate, z_dim=16)
-        # Ensure VoiceController matches the new dimensions
-        self.controller = VoiceController(z_dim=16, n_filter_bins=65)
-        self.decoder = NeuralVoiceDecoder(sample_rate=sample_rate, n_filter_bins=65)
+        self.encoder = AudioFeatureEncoder(
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            n_mels=n_mels,
+            z_dim=z_dim,
+        )
+        self.controller = VoiceController(z_dim=z_dim, n_filter_bins=n_filter_bins)
+        self.decoder = NeuralVoiceDecoder(
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            n_filter_bins=n_filter_bins,
+        )
         self.reverb = LearnableReverb(sample_rate=sample_rate, reverb_duration=0.5)
 
     def forward(self, audio, gender, age):
@@ -388,7 +395,7 @@ class VoiceAutoEncoder(nn.Module):
 
         controls = self.controller(f0, loud_db, z, gender_bc, age_bc)
         dry_audio = self.decoder(
-            f0=controls["f0"],
+            f0=f0,
             amplitude=controls["amplitude"],
             open_quotient=controls["open_quotient"],
             vocal_tract_curve=controls["vocal_tract_curve"],
@@ -399,66 +406,10 @@ class VoiceAutoEncoder(nn.Module):
         return wet_audio, dry_audio, controls
 
 
-class MultiScaleSpectralLoss(nn.Module):
-    def __init__(self, fft_sizes=None, mag_weight=1.0, log_mag_weight=1.0):
-        super().__init__()
-        if fft_sizes is None:
-            fft_sizes = [2048, 1024, 512, 256, 128, 64]
-        self.fft_sizes = fft_sizes
-        self.mag_weight = mag_weight
-        self.log_mag_weight = log_mag_weight
-
-    @staticmethod
-    def spectrogram(x, n_fft):
-        hop_length = int(n_fft * 0.25)
-        window = torch.hann_window(n_fft).to(x.device)
-        x_stft = torch.stft(
-            x,
-            n_fft,
-            hop_length,
-            win_length=n_fft,
-            window=window,
-            return_complex=True,
-            center=True,
-        )
-        return torch.clamp(torch.abs(x_stft), min=1e-7)
-
-    def forward(self, x_pred, x_target):
-        loss = 0.0
-        for n_fft in self.fft_sizes:
-            mag_pred = self.spectrogram(x_pred, n_fft)
-            mag_target = self.spectrogram(x_target, n_fft)
-            loss += self.mag_weight * F.l1_loss(mag_pred, mag_target)
-            loss += self.log_mag_weight * F.l1_loss(
-                torch.log(mag_pred), torch.log(mag_target)
-            )
-        return loss
-
-
 class MultiScaleMelLoss(nn.Module):
-    """
-    Multi‑scale mel‑spectrogram loss.
-
-    Computes L1 distance between mel and log‑mel magnitudes across multiple
-    STFT configurations. Designed as a drop‑in alternative to
-    `MultiScaleSpectralLoss`.
-
-    Args:
-        sample_rate: Audio sample rate.
-        fft_sizes: List of FFT sizes to use for the multi‑scale mel features.
-        n_mels: Number of mel bands for each scale (int or list matching fft_sizes).
-        mel_weight: Weight for linear mel magnitude term.
-        log_mel_weight: Weight for log mel magnitude term.
-        hop_ratio: Hop length as a ratio of n_fft (e.g., 0.25 means 25%).
-        power: Power for magnitude in MelSpectrogram (1.0 -> magnitude, 2.0 -> power).
-        f_min: Minimum frequency for mel filter bank.
-        f_max: Maximum frequency for mel filter bank (None -> Nyquist).
-        norm: Mel scale normalization (passed to torchaudio MelSpectrogram).
-    """
-
     def __init__(
         self,
-        sample_rate: int = 16000,
+        sample_rate: int,
         fft_sizes=None,
         n_mels=80,
         mel_weight: float = 1.0,
@@ -472,9 +423,9 @@ class MultiScaleMelLoss(nn.Module):
         super().__init__()
 
         if fft_sizes is None:
+            # Default fallback if not provided
             fft_sizes = [2048, 1024, 512, 256]
 
-        # Ensure f_max is consistent with Nyquist
         if f_max is None:
             f_max = sample_rate / 2.0
 
@@ -535,7 +486,6 @@ class MultiScaleMelLoss(nn.Module):
             mel_pred = mel(x_pred)
             mel_tgt = mel(x_target)
 
-            # Use L1 on mel and log‑mel
             loss = loss + self.mel_weight * F.l1_loss(mel_pred, mel_tgt)
             loss = loss + self.log_mel_weight * F.l1_loss(
                 torch.log(mel_pred.clamp_min(eps)), torch.log(mel_tgt.clamp_min(eps))
@@ -551,7 +501,7 @@ class MultiScaleMelLoss(nn.Module):
 
 class CsvAudioDataset(Dataset):
     def __init__(
-        self, csv_path, clips_root, sample_rate=16000, chunk_size=32000, limit=4
+        self, csv_path, clips_root, sample_rate, chunk_size, limit=4
     ):
         self.sr = sample_rate
         self.chunk_size = chunk_size
@@ -565,7 +515,6 @@ class CsvAudioDataset(Dataset):
         else:
             self.data = df
 
-        # Pre-compute class indices map
         self.age_to_idx = {label: i for i, label in enumerate(AGE_LABELS)}
 
     def __len__(self):
@@ -614,15 +563,16 @@ def convert_voice(
     input_wav,
     output_wav,
     target_gender_balance,
-    target_age_float,  # Changed param name to clarify it's a float 0.0-1.0
+    target_age_float,
     pitch_shift=0.0,
     device="cpu",
+    sample_rate=16000,
 ):
     audio, sr = torchaudio.load(input_wav)
     if audio.shape[0] > 1:
         audio = torch.mean(audio, dim=0, keepdim=True)
-    if sr != SAMPLE_RATE:
-        audio = T.Resample(sr, SAMPLE_RATE)(audio)
+    if sr != sample_rate:
+        audio = T.Resample(sr, sample_rate)(audio)
 
     audio = audio / (torch.abs(audio).max() + 1e-6)
     audio = audio.to(device)
@@ -645,7 +595,7 @@ def convert_voice(
         g_vec = torch.tensor([gm, gf], device=device).float()
         g_tensor = g_vec.view(1, 1, 2).expand(1, frames, -1)
 
-        # Age (Using weighted utility)
+        # Age
         a_vec = float_to_weighted_age(target_age_float, device=device)
         a_tensor = a_vec.view(1, 1, -1).expand(1, frames, -1)
 
@@ -665,92 +615,83 @@ def convert_voice(
 
     wet_audio = wet_audio.cpu()
     wet_audio = wet_audio / (torch.abs(wet_audio).max() + 1e-6)
-    torchaudio.save(output_wav, wet_audio, SAMPLE_RATE)
+    torchaudio.save(output_wav, wet_audio, sample_rate)
     print(f"Saved: {output_wav}")
 
 
-def process_tsv(file_path, output_path):
-    # 1. Load the TSV file
-    # Polars uses read_csv with a separator argument for TSV
-    df = pl.read_csv(
-        file_path, separator="\t", ignore_errors=True, encoding="utf-8", quote_char=""
-    )
-
-    # 2. Apply Filters
-    # - path is not null
-    # - age is not null
-    # - gender is exactly 'male' or 'female'
-    filtered_df = df.filter(
-        pl.col("path").is_not_null()
-        & pl.col("age").is_not_null()
-        & pl.col("gender").is_not_null()
-    ).select(
-        ["path", "age", "gender"]
-    )  # Discard everything else
-
-    # 3. Inspect results
-    print(f"Original rows: {len(df)}")
-    print(f"Filtered rows: {len(filtered_df)}")
-    print(filtered_df.head())
-
-    # Optional: Save back to TSV
-    filtered_df.write_csv(output_path)
-
-    # Extract unique values
-    unique_genders = filtered_df.select(pl.col("gender").unique()).to_series().to_list()
-    unique_ages = filtered_df.select(pl.col("age").unique()).to_series().to_list()
-
-    print("Unique Genders:", unique_genders)
-    print("Unique Ages:", unique_ages)
-
-
 # ==========================================
-# 5. Main Execution (Fixed: Batch Logging & Configs)
+# 5. Main Execution
 # ==========================================
 
 # --- Configuration ---
+# PATHS
 CSV_PATH = "data/filtered_dataset.csv"
 TSV_PATH = "/mnt/data/ai/cv-corpus-23.0-2025-09-05/tr/validated.tsv"
 CLIPS_DIR = "/mnt/data/ai/cv-corpus-23.0-2025-09-05/tr/clips"
 CHECKPOINT_DIR = "checkpoints"
+INPUT_WAV = "/mnt/Data/Audio/misc/haiku.mp3"
+CHECKPOINT = f"{CHECKPOINT_DIR}/model_last.pth"
+
+# AUDIO & DSP CONSTANTS
+SAMPLE_RATE = 48000
+N_FFT = 2048         # Increased for 48k (approx 42ms window)
+HOP_LENGTH = 512     # Approx 10ms hop
+N_MELS = 80
+N_FILTER_BINS = 65   # Resolution of the vocal tract controller output
+Z_DIM = 16
+
+# TRAINING HYPERPARAMETERS
+N_EPOCHS = 100
+BATCH_SIZE = 16
+N_CHECKPOINTS = 1000
+N_LOG = 100
+LIMIT = 0            # 0 = Use Full Dataset
+
+# LOSS CONFIG
+# Multiscale FFT sizes appropriate for 48kHz
+LOSS_FFT_SIZES = [4096, 2048, 1024, 512]
+LOSS_N_MELS = [80, 80, 64, 40]
+
 
 DEVICE = "cpu"
 if torch.cuda.is_available():
     DEVICE = "cuda"
-# The operator 'aten::unfold_backward' is not currently implemented for the MPS device.
-# elif torch.backends.mps.is_available():
-#     DEVICE = "mps"
 
-SAMPLE_RATE = 16000
-N_EPOCHS = 100
-
-# Restored Variables
-N_CHECKPOINTS = 1000  # Save every 1000 batches
-N_LOG = 100  # Log every 100 batches
-LIMIT = 0  # 0 = Use Full Dataset
-BATCH_SIZE = 16  # Restored variable
-
-# Update this to point to a specific step checkpoint if needed
-CHECKPOINT = f"{CHECKPOINT_DIR}/model_last.pth"
-INPUT_WAV = "/mnt/Data/Audio/misc/haiku.mp3"
 
 def training():
     # --- Setup ---
-    model = VoiceAutoEncoder(sample_rate=SAMPLE_RATE).to(DEVICE)
+    # Pass all configuration constants explicitly
+    model = VoiceAutoEncoder(
+        sample_rate=SAMPLE_RATE,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+        n_mels=N_MELS,
+        z_dim=Z_DIM,
+        n_filter_bins=N_FILTER_BINS,
+    ).to(DEVICE)
 
     # Load Data
-    dataset = CsvAudioDataset(CSV_PATH, CLIPS_DIR, limit=LIMIT, chunk_size=32000)
+    # Use Global SAMPLE_RATE and a Chunk Size dependent on SR
+    chunk_samples = 2 * SAMPLE_RATE  # 2 seconds per chunk
+    dataset = CsvAudioDataset(
+        CSV_PATH,
+        CLIPS_DIR,
+        limit=LIMIT,
+        sample_rate=SAMPLE_RATE,
+        chunk_size=chunk_samples,
+    )
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
 
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    # criterion = MultiScaleSpectralLoss().to(DEVICE)
+
     criterion = MultiScaleMelLoss(
         sample_rate=SAMPLE_RATE,
-        fft_sizes=[2048, 1024, 512, 256],
-        n_mels=[80, 80, 64, 40],
+        fft_sizes=LOSS_FFT_SIZES,
+        n_mels=LOSS_N_MELS,
     ).to(DEVICE)
 
     print(f"Starting Training on {DEVICE}...")
+    print(f"SR: {SAMPLE_RATE}, FFT: {N_FFT}, Hop: {HOP_LENGTH}")
     print(f"Dataset Size: {len(dataset)} | Batch Size: {BATCH_SIZE}")
 
     num_batches = 0
@@ -783,7 +724,7 @@ def training():
             if num_batches % N_LOG == 0:
                 avg_loss = batch_loss_accum / N_LOG
                 print(f"Epoch {epoch} | Batch {num_batches} | Loss: {avg_loss:.4f}")
-                batch_loss_accum = 0.0  # Reset accumulator
+                batch_loss_accum = 0.0
 
             # --- Batch-Level Checkpointing ---
             if num_batches % N_CHECKPOINTS == 0:
@@ -792,8 +733,8 @@ def training():
                 # 1. Save Model
                 save_path = f"{CHECKPOINT_DIR}/model_step{num_batches}.pth"
                 torch.save(model.state_dict(), save_path)
-                save_path = f"{CHECKPOINT_DIR}/model_last.pth"
-                torch.save(model.state_dict(), save_path)
+                save_path_last = f"{CHECKPOINT_DIR}/model_last.pth"
+                torch.save(model.state_dict(), save_path_last)
 
                 # 2. Save Random Reconstruction
                 with torch.no_grad():
@@ -816,7 +757,14 @@ def training():
 
 def inference():
     # --- Inference Demo ---
-    model = VoiceAutoEncoder(sample_rate=SAMPLE_RATE).to(DEVICE)
+    model = VoiceAutoEncoder(
+        sample_rate=SAMPLE_RATE,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+        n_mels=N_MELS,
+        z_dim=Z_DIM,
+        n_filter_bins=N_FILTER_BINS,
+    ).to(DEVICE)
 
     if os.path.exists(CHECKPOINT) and os.path.exists(INPUT_WAV):
         print(f"Loading {CHECKPOINT}...")
@@ -832,6 +780,7 @@ def inference():
             0.4,
             pitch_shift=7.0,
             device=DEVICE,
+            sample_rate=SAMPLE_RATE,
         )
         convert_voice(
             model,
@@ -841,6 +790,7 @@ def inference():
             0.4,
             pitch_shift=-7.0,
             device=DEVICE,
+            sample_rate=SAMPLE_RATE,
         )
     else:
         print("Checkpoint or Input Wav not found.")
