@@ -691,6 +691,15 @@ def training():
             if num_batches % N_CHECKPOINTS == 0:
                 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
                 torch.save(model.state_dict(), f"{CHECKPOINT_DIR}/model_last.pth")
+                with torch.no_grad():
+                    test_audio = audio[0:1].to(DEVICE)
+                    test_gender = gender[0:1].to(DEVICE)
+                    test_age = age[0:1].to(DEVICE)
+                    output_wet, _, _ = model(test_audio, test_gender, test_age)
+                    output_wet = output_wet.squeeze(1).cpu()
+                    output_wet = output_wet / (torch.abs(output_wet).max() + 1e-6)
+                    torchaudio.save(f"{CHECKPOINT_DIR}/output_epoch_{epoch}_batch_{num_batches}.wav", output_wet, SAMPLE_RATE)
+
                 print(f"--> Saved Checkpoint")
 
 if __name__ == "__main__":
