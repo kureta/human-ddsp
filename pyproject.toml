@@ -15,13 +15,16 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-  "librosa>=0.11.0",
-  "nn-tilde>=1.5.6",
-  "numpy>=2.3.5",
-  "polars>=1.36.1",
-  "scipy>=1.16.3",
+  "librosa~=0.11.0",
+  "marimo>=0.18.4",
+  "matplotlib>=3.10.8",
+  "nn-tilde~=1.5.6",
+  "numpy~=2.3.5",
+  "polars~=1.36.1",
+  "scipy~=1.16.3",
   "scipy-stubs~=1.16.3",
-  "soundfile>=0.13.1",
+  "soundfile~=0.13.1",
   "torch~=2.5.0",
-  "torchaudio>=2.5.1",
+  "torchaudio~=2.5.1",
+  "tqdm>=4.67.1",
 ]
