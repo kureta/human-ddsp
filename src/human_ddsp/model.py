@@ -32,6 +32,16 @@ class VoiceController(nn.Module):
             dropout=0.2 if config.num_layers > 1 else 0,
         )
         
+        # Shared MLP block after GRU
+        self.shared_mlp = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.LayerNorm(config.hidden_size),
+            nn.LeakyReLU(0.1),
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.LayerNorm(config.hidden_size),
+            nn.LeakyReLU(0.1),
+        )
+        
         # Projection layers to output DSP parameters
         self.proj_voiced_amp = nn.Linear(config.hidden_size, 1)
         self.proj_unvoiced_amp = nn.Linear(config.hidden_size, 1)
@@ -66,7 +76,10 @@ class VoiceController(nn.Module):
         ], dim=-1)
         
         # Process through GRU
-        hidden, _ = self.gru(controller_input)
+        gru_out, _ = self.gru(controller_input)
+        
+        # Process through shared MLP
+        hidden = self.shared_mlp(gru_out)
         
         # Project to synthesis parameters
         voiced_amp = torch.sigmoid(self.proj_voiced_amp(hidden))

@@ -16,11 +16,11 @@ class AudioConfig:
     f_max: float = 8000.0
     
     # Content Encoder
-    content_dim: int = 64
+    content_dim: int = 128  # Increased from 64
     content_kernel_size: int = 3
     
     # Controller
-    hidden_size: int = 256
+    hidden_size: int = 512  # Increased from 256
     num_layers: int = 2
     
     # Synth

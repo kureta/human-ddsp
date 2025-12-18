@@ -129,8 +129,10 @@ class MfcContentExtractor(nn.Module):
         
         mfcc_dim = config.mfcc_keep_end - config.mfcc_keep_start
         
+        # Normalize the input MFCCs frame-by-frame
+        self.input_norm = nn.LayerNorm(mfcc_dim)
+        
         # Fully Connected Encoder (MLP)
-        # Operates frame-by-frame, no temporal caching required.
         self.encoder = nn.Sequential(
             nn.Linear(mfcc_dim, config.content_dim),
             nn.LayerNorm(config.content_dim),
@@ -158,6 +160,9 @@ class MfcContentExtractor(nn.Module):
         
         # Transpose to [Batch, Time, Features] for Linear layers
         x = mfccs_filtered.transpose(1, 2)
+        
+        # Normalize the input features
+        x = self.input_norm(x)
         
         # Pass through MLP encoder
         content_embedding = self.encoder(x) # [B, T, content_dim]
