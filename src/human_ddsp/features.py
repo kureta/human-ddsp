@@ -107,40 +107,28 @@ class LoudnessDetector(nn.Module):
         return loudness_db.transpose(1, 2)
 
 
-class MfcContentExtractor(nn.Module):
+class MelContentExtractor(nn.Module):
     """
-    Extracts a hidden content representation from MFCCs using a fully connected encoder.
+    Extracts content features using Log-Mel Spectrograms with Instance Normalization.
     """
     def __init__(self, config: AudioConfig):
         super().__init__()
-        self.mfcc_transform = T.MFCC(
+        self.mel_transform = T.MelSpectrogram(
             sample_rate=config.sample_rate,
-            n_mfcc=config.n_mfcc,
-            melkwargs={
-                "n_fft": config.n_fft,
-                "hop_length": config.hop_length,
-                "n_mels": config.n_mels,
-                "f_min": config.f_min,
-                "f_max": config.f_max,
-            },
+            n_fft=config.n_fft,
+            hop_length=config.hop_length,
+            n_mels=config.n_mels,
+            f_min=config.f_min,
+            f_max=config.f_max,
+            power=2.0
         )
-        self.mfcc_keep_start = config.mfcc_keep_start
-        self.mfcc_keep_end = config.mfcc_keep_end
         
-        mfcc_dim = config.mfcc_keep_end - config.mfcc_keep_start
+        # Instance Norm to remove static timbre/channel effects
+        # We normalize over the time dimension for each frequency bin
+        self.instance_norm = nn.InstanceNorm1d(config.n_mels, affine=False)
         
-        # Normalize the input MFCCs frame-by-frame
-        self.input_norm = nn.LayerNorm(mfcc_dim)
-        
-        # Fully Connected Encoder (MLP)
-        self.encoder = nn.Sequential(
-            nn.Linear(mfcc_dim, config.content_dim),
-            nn.LayerNorm(config.content_dim),
-            nn.LeakyReLU(0.1),
-            nn.Linear(config.content_dim, config.content_dim),
-            nn.LayerNorm(config.content_dim),
-            nn.LeakyReLU(0.1),
-        )
+        # Simple projection to match content_dim
+        self.projection = nn.Linear(config.n_mels, config.content_dim)
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
         """
@@ -150,21 +138,24 @@ class MfcContentExtractor(nn.Module):
             audio (torch.Tensor): Input audio, shape [Batch, Length].
         
         Returns:
-            torch.Tensor: Hidden content representation, shape [Batch, Time, content_dim].
+            torch.Tensor: Content embedding, shape [Batch, Time, content_dim].
         """
-        # Calculate MFCCs
-        mfccs = self.mfcc_transform(audio) # [B, n_mfcc, T]
+        # 1. Mel Spectrogram
+        mels = self.mel_transform(audio) # [B, n_mels, T]
         
-        # Filter MFCCs to remove loudness (0th) and pitch (higher) info
-        mfccs_filtered = mfccs[:, self.mfcc_keep_start:self.mfcc_keep_end, :] # [B, C, T]
+        # 2. Log Compression
+        log_mels = torch.log(mels + 1e-5)
         
-        # Transpose to [Batch, Time, Features] for Linear layers
-        x = mfccs_filtered.transpose(1, 2)
+        # 3. Instance Normalization
+        # InstanceNorm1d expects [B, Channels, Length]
+        # It normalizes across Length (Time) for each Channel (Freq Bin)
+        norm_mels = self.instance_norm(log_mels)
         
-        # Normalize the input features
-        x = self.input_norm(x)
+        # 4. Transpose for Linear Projection
+        # [B, n_mels, T] -> [B, T, n_mels]
+        x = norm_mels.transpose(1, 2)
         
-        # Pass through MLP encoder
-        content_embedding = self.encoder(x) # [B, T, content_dim]
+        # 5. Linear Projection
+        content_embedding = self.projection(x) # [B, T, content_dim]
         
         return content_embedding

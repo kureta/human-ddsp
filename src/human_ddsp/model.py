@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from human_ddsp.config import AudioConfig
 from human_ddsp.dsp import GlottalPulseSynth, FormantFilter, LearnableReverb
-from human_ddsp.features import PitchDetector, LoudnessDetector, MfcContentExtractor
+from human_ddsp.features import PitchDetector, LoudnessDetector, MelContentExtractor
 
 # Define AGE_LABELS and NUM_AGE_CLASSES at the module level
 AGE_LABELS = [
@@ -118,7 +118,7 @@ class VoiceSynth(nn.Module):
         # Feature Extractors
         self.pitch_detector = PitchDetector(config)
         self.loudness_detector = LoudnessDetector(config)
-        self.content_extractor = MfcContentExtractor(config)
+        self.content_extractor = MelContentExtractor(config)
         
         # Controller
         self.controller = VoiceController(config)

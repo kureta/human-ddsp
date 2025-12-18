@@ -18,6 +18,7 @@ dependencies = [
   "librosa>=0.11.0",
   "nn-tilde>=1.5.6",
   "numpy>=2.3.5",
+  "pandas>=2.3.3",
   "polars>=1.36.1",
   "scipy>=1.16.3",
   "scipy-stubs~=1.16.3",
