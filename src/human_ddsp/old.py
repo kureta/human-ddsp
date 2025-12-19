@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import torchaudio
 import torchaudio.transforms as T
+import torchaudio.functional as F_audio
 from torch.utils.data import DataLoader, Dataset
 
 # Optional: Polars for data loading
@@ -19,46 +20,55 @@ try:
 except ImportError:
     pl = None
 
+
 # ==========================================
 # Age Config & Utilities
 # ==========================================
 
-AGE_LABELS = ["teens", "twenties", "thirties", "fourties", "fifties", "sixties",
-              "seventies", "eighties", ]
+AGE_LABELS = [
+    "teens",
+    "twenties",
+    "thirties",
+    "fourties",
+    "fifties",
+    "sixties",
+    "seventies",
+    "eighties",
+]
 NUM_AGE_CLASSES = len(AGE_LABELS)
 
 
 def calculate_max_n_mels(sr, n_fft, fmin=0.0, fmax=None):
     if fmax is None:
         fmax = sr / 2
-
+        
     def hz_to_mel(f):
         return 2595 * np.log10(1 + f / 700.0)
-
+    
     def mel_to_hz(m):
-        return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+        return 700.0 * (10.0**(m / 2595.0) - 1.0)
 
     min_mel = hz_to_mel(fmin)
     max_mel = hz_to_mel(fmax)
-
+    
     # Binary search for the maximum n_mels that maintains strictly increasing bins
     low, high = 1, n_fft
     max_valid = 1
-
+    
     while low <= high:
         mid = (low + high) // 2
         mels = np.linspace(min_mel, max_mel, mid + 2)
         hertz = mel_to_hz(mels)
         # Convert Hz to FFT bin indices
         bins = np.floor((n_fft + 1) * hertz / sr).astype(int)
-
+        
         # Check if every filter spans at least one bin range
         if np.all(np.diff(bins) > 0):
             max_valid = mid
             low = mid + 1
         else:
             high = mid - 1
-
+            
     return max_valid
 
 
@@ -104,10 +114,14 @@ def float_to_weighted_age(age_float: float, device="cpu"):
 def _create_a_weighting(n_fft, sr):
     """Creates the A-weighting curve for Perceptual Loudness."""
     freqs = torch.linspace(0, sr / 2, n_fft // 2 + 1)
-    f_sq = freqs ** 2
-    term1 = 12194.217 ** 2 * f_sq ** 2
-    term2 = ((f_sq + 20.6 ** 2) * (f_sq + 107.7 ** 2) * (f_sq + 737.9 ** 2) * (
-            f_sq + 12194.217 ** 2) ** 0.5)
+    f_sq = freqs**2
+    term1 = 12194.217**2 * f_sq**2
+    term2 = (
+        (f_sq + 20.6**2)
+        * (f_sq + 107.7**2)
+        * (f_sq + 737.9**2)
+        * (f_sq + 12194.217**2) ** 0.5
+    )
     gain = term1 / (term2 + 1e-8)
     return gain
 
@@ -129,7 +143,7 @@ class NeuralVoiceDecoder(nn.Module):
         oq = torch.clamp(open_quotient, 0.1, 0.9)
         scaled_phase = p / (oq + 1e-8)
 
-        pulse = 0.5 * (1.0 - torch.cos(np.pi * scaled_phase))
+        pulse = 0.5 * (1.0 - torch.cos(torch.pi * scaled_phase))
         mask = torch.sigmoid((oq - p) * 100.0)
         glottal_wave = pulse * mask
 
@@ -139,25 +153,41 @@ class NeuralVoiceDecoder(nn.Module):
 
     def apply_filter(self, excitation, filter_magnitudes):
         # 1. STFT
-        ex_stft = torch.stft(excitation, self.n_fft, self.hop_length,
-                             win_length=self.n_fft, window=self.window, center=True,
-                             return_complex=True, )
+        ex_stft = torch.stft(
+            excitation,
+            self.n_fft,
+            self.hop_length,
+            win_length=self.n_fft,
+            window=self.window,
+            center=True,
+            return_complex=True,
+        )
 
         # 2. Interpolate Filter
         filter_mod = filter_magnitudes.transpose(1, 2)
-        filter_resized = F.interpolate(filter_mod, size=ex_stft.shape[2], mode="linear",
-                                       align_corners=False)
+        filter_resized = F.interpolate(
+            filter_mod, size=ex_stft.shape[2], mode="linear", align_corners=False
+        )
         target_bins = ex_stft.shape[1]
-        filter_final = F.interpolate(filter_resized.transpose(1, 2), size=target_bins,
-                                     mode="linear", align_corners=False, ).transpose(1, 2)
+        filter_final = F.interpolate(
+            filter_resized.transpose(1, 2),
+            size=target_bins,
+            mode="linear",
+            align_corners=False,
+        ).transpose(1, 2)
 
         # 3. Filter
         output_stft = ex_stft * filter_final.type_as(ex_stft)
 
         # 4. iSTFT
-        output_audio = torch.istft(output_stft, self.n_fft, self.hop_length,
-                                   win_length=self.n_fft, window=self.window,
-                                   length=excitation.shape[-1], )
+        output_audio = torch.istft(
+            output_stft,
+            self.n_fft,
+            self.hop_length,
+            win_length=self.n_fft,
+            window=self.window,
+            length=excitation.shape[-1],
+        )
         return output_audio
 
     @staticmethod
@@ -166,8 +196,15 @@ class NeuralVoiceDecoder(nn.Module):
         x = F.interpolate(x, size=target_length, mode="linear", align_corners=False)
         return x.squeeze(1)
 
-    def forward(self, f0, amplitude, open_quotient, vocal_tract_curve, noise_filter_curve,
-                target_length: int, ):
+    def forward(
+        self,
+        f0,
+        amplitude,
+        open_quotient,
+        vocal_tract_curve,
+        noise_filter_curve,
+        target_length: int,
+    ):
         f0_up = self._upsample(f0, target_length)
         amp_up = self._upsample(amplitude, target_length)
         oq_up = self._upsample(open_quotient, target_length)
@@ -224,8 +261,15 @@ class LearnableReverb(nn.Module):
 
 
 class AudioFeatureEncoder(nn.Module):
-    def __init__(self, sample_rate=48000, n_fft=1024, hop_length=256, n_mels=80, z_dim=16,
-                 gru_units=256, ):
+    def __init__(
+        self,
+        sample_rate=48000,
+        n_fft=1024,
+        hop_length=256,
+        n_mels=80,
+        z_dim=16,
+        gru_units=256,
+    ):
         super().__init__()
         self.sample_rate = sample_rate
         self.hop_length = hop_length
@@ -236,10 +280,18 @@ class AudioFeatureEncoder(nn.Module):
         self.register_buffer("a_weighting", _create_a_weighting(n_fft, sample_rate))
 
         # Content Encoder
-        self.melspec = T.MelSpectrogram(sample_rate=sample_rate, n_fft=n_fft,
-                                        hop_length=hop_length, n_mels=n_mels)
+        self.melspec = T.MelSpectrogram(
+            sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels
+        )
         self.norm = nn.InstanceNorm1d(n_mels)
-        self.rnn = nn.GRU(n_mels, gru_units, batch_first=True)
+        
+        # Dynamic liftering: keep half of the coefficients
+        self.n_mfcc = n_mels // 2
+        dct_mat = F_audio.create_dct(self.n_mfcc, n_mels, norm="ortho")
+        self.register_buffer("dct_mat", dct_mat)
+        
+        # Input to RNN is n_mfcc - 1 (dropping 0th coefficient)
+        self.rnn = nn.GRU(self.n_mfcc - 1, gru_units, batch_first=True)
         self.projection = nn.Linear(gru_units, z_dim)
 
     def get_pitch(self, audio):
@@ -288,10 +340,30 @@ class AudioFeatureEncoder(nn.Module):
         Runs RNN on Mels and applies Temporal Bottleneck.
         Expected mels shape: [Batch, Time, Mels]
         """
-        rnn_out, _ = self.rnn(mels)
+        # Apply DCT to get MFCCs
+        # mels: [B, T, n_mels]
+        # dct_mat: [n_mfcc, n_mels]
+        # We want: [B, T, n_mfcc]
+        mfcc = torch.matmul(mels, self.dct_mat.t())
+        
+        # Drop 0th coefficient (loudness)
+        mfcc = mfcc[..., 1:]
+        
+        rnn_out, _ = self.rnn(mfcc)
         z = self.projection(rnn_out)  # [Batch, Time, z_dim]
 
         return z
+
+        # --- Temporal Bottleneck ---
+        # 1. Downsample (Average Pool)
+        # Transpose to [Batch, Feat, Time] for pooling
+        z_t = z.transpose(1, 2)
+        z_down = F.avg_pool1d(z_t, kernel_size=4, stride=4)
+
+        # 2. Upsample (Linear Interpolation)
+        z_up = F.interpolate(
+            z_down, size=z.shape[1], mode="linear", align_corners=False
+        )
 
         return z_up.transpose(1, 2)
 
@@ -336,17 +408,23 @@ class VoiceController(nn.Module):
         # We calculate the mean pitch for THIS specific audio clip.
         f0_mean = torch.mean(f0_log, dim=1, keepdim=True)
         f0_relative = f0_log - f0_mean
+
+        # Optional: Normalize Loudness too (removes recording gain differences)
+        loudness_mean = torch.mean(loudness_db, dim=1, keepdim=True)
+        loudness_relative = loudness_db - loudness_mean
         # ------------------------
 
-        loudness_norm = (loudness_db / 100.0) + 1.0
-
-        decoder_input = torch.cat([z, f0_relative, loudness_norm, gender, age], dim=-1)
+        # Use RELATIVE pitch/loudness for the controller inputs
+        decoder_input = torch.cat([z, f0_relative, loudness_relative, gender, age], dim=-1)
         hidden = self.mlp(decoder_input)
 
-        return {"f0": f0, "amplitude": torch.pow(10.0, loudness_db / 20.0),
-                "open_quotient": torch.sigmoid(self.proj_oq(hidden)),
-                "vocal_tract_curve": torch.sigmoid(self.proj_vt(hidden)),
-                "noise_filter_curve": torch.sigmoid(self.proj_nf(hidden)), }
+        return {
+            "f0": f0,
+            "amplitude": torch.pow(10.0, loudness_db / 20.0),
+            "open_quotient": torch.sigmoid(self.proj_oq(hidden)),
+            "vocal_tract_curve": torch.sigmoid(self.proj_vt(hidden)),
+            "noise_filter_curve": torch.sigmoid(self.proj_nf(hidden)),
+        }
 
 
 class VoiceAutoEncoder(nn.Module):
@@ -372,11 +450,14 @@ class VoiceAutoEncoder(nn.Module):
         age_bc = age.unsqueeze(1).expand(-1, frames, -1)
 
         controls = self.controller(f0, loud_db, z, gender_bc, age_bc)
-        dry_audio = self.decoder(f0=controls["f0"], amplitude=controls["amplitude"],
-                                 open_quotient=controls["open_quotient"],
-                                 vocal_tract_curve=controls["vocal_tract_curve"],
-                                 noise_filter_curve=controls["noise_filter_curve"],
-                                 target_length=audio.shape[-1], )
+        dry_audio = self.decoder(
+            f0=controls["f0"],
+            amplitude=controls["amplitude"],
+            open_quotient=controls["open_quotient"],
+            vocal_tract_curve=controls["vocal_tract_curve"],
+            noise_filter_curve=controls["noise_filter_curve"],
+            target_length=audio.shape[-1],
+        )
         wet_audio = self.reverb(dry_audio)
         return wet_audio, dry_audio, controls
 
@@ -394,8 +475,15 @@ class MultiScaleSpectralLoss(nn.Module):
     def spectrogram(x, n_fft):
         hop_length = int(n_fft * 0.25)
         window = torch.hann_window(n_fft).to(x.device)
-        x_stft = torch.stft(x, n_fft, hop_length, win_length=n_fft, window=window,
-                            return_complex=True, center=True, )
+        x_stft = torch.stft(
+            x,
+            n_fft,
+            hop_length,
+            win_length=n_fft,
+            window=window,
+            return_complex=True,
+            center=True,
+        )
         return torch.clamp(torch.abs(x_stft), min=1e-7)
 
     def forward(self, x_pred, x_target):
@@ -404,8 +492,9 @@ class MultiScaleSpectralLoss(nn.Module):
             mag_pred = self.spectrogram(x_pred, n_fft)
             mag_target = self.spectrogram(x_target, n_fft)
             loss += self.mag_weight * F.l1_loss(mag_pred, mag_target)
-            loss += self.log_mag_weight * F.l1_loss(torch.log(mag_pred),
-                                                    torch.log(mag_target))
+            loss += self.log_mag_weight * F.l1_loss(
+                torch.log(mag_pred), torch.log(mag_target)
+            )
         return loss
 
 
@@ -430,10 +519,19 @@ class MultiScaleMelLoss(nn.Module):
         norm: Mel scale normalization (passed to torchaudio MelSpectrogram).
     """
 
-    def __init__(self, sample_rate: int = 48000, fft_sizes=None, n_mels=80,
-                 mel_weight: float = 1.0, log_mel_weight: float = 1.0,
-                 hop_ratio: float = 0.25, power: float = 1.0, f_min: float = 0.0,
-                 f_max: float | None = None, norm: str | None = "slaney", ):
+    def __init__(
+        self,
+        sample_rate: int = 48000,
+        fft_sizes=None,
+        n_mels=80,
+        mel_weight: float = 1.0,
+        log_mel_weight: float = 1.0,
+        hop_ratio: float = 0.25,
+        power: float = 1.0,
+        f_min: float = 0.0,
+        f_max: float | None = None,
+        norm: str | None = "slaney",
+    ):
         super().__init__()
 
         if fft_sizes is None:
@@ -445,7 +543,8 @@ class MultiScaleMelLoss(nn.Module):
 
         if not (0.0 <= f_min < f_max):
             raise ValueError(
-                f"Expected 0 <= f_min < f_max, got f_min={f_min}, f_max={f_max}")
+                f"Expected 0 <= f_min < f_max, got f_min={f_min}, f_max={f_max}"
+            )
 
         # Allow a single int or a list per scale
         if isinstance(n_mels, int):
@@ -453,7 +552,8 @@ class MultiScaleMelLoss(nn.Module):
         else:
             n_mels_list = n_mels
             assert len(n_mels_list) == len(
-                fft_sizes), "n_mels list must match fft_sizes length"
+                fft_sizes
+            ), "n_mels list must match fft_sizes length"
 
         self.mel_weight = mel_weight
         self.log_mel_weight = log_mel_weight
@@ -467,14 +567,23 @@ class MultiScaleMelLoss(nn.Module):
             n_freqs = n_fft // 2 + 1
             nm_safe = int(min(nm, n_freqs - 1))
 
-            self.transforms.append(T.MelSpectrogram(sample_rate=sample_rate, n_fft=n_fft,
-                                                    hop_length=hop_length,
-                                                    win_length=n_fft,
-                                                    window_fn=torch.hann_window,
-                                                    n_mels=nm_safe, f_min=f_min,
-                                                    f_max=f_max, power=power,
-                                                    normalized=False, norm=norm,
-                                                    center=True, pad_mode="reflect", ))
+            self.transforms.append(
+                T.MelSpectrogram(
+                    sample_rate=sample_rate,
+                    n_fft=n_fft,
+                    hop_length=hop_length,
+                    win_length=n_fft,
+                    window_fn=torch.hann_window,
+                    n_mels=nm_safe,
+                    f_min=f_min,
+                    f_max=f_max,
+                    power=power,
+                    normalized=False,
+                    norm=norm,
+                    center=True,
+                    pad_mode="reflect",
+                )
+            )
 
     def forward(self, x_pred: torch.Tensor, x_target: torch.Tensor):
         # Ensure shape is (B, T)
@@ -492,7 +601,8 @@ class MultiScaleMelLoss(nn.Module):
             # Use L1 on mel and log‑mel
             loss = loss + self.mel_weight * F.l1_loss(mel_pred, mel_tgt)
             loss = loss + self.log_mel_weight * F.l1_loss(
-                torch.log(mel_pred.clamp_min(eps)), torch.log(mel_tgt.clamp_min(eps)))
+                torch.log(mel_pred.clamp_min(eps)), torch.log(mel_tgt.clamp_min(eps))
+            )
 
         return loss
 
@@ -503,8 +613,9 @@ class MultiScaleMelLoss(nn.Module):
 
 
 class CsvAudioDataset(Dataset):
-    def __init__(self, csv_path, clips_root, sample_rate=48000, chunk_size=32000,
-                 limit=4):
+    def __init__(
+        self, csv_path, clips_root, sample_rate=48000, chunk_size=32000, limit=4
+    ):
         self.sr = sample_rate
         self.chunk_size = chunk_size
         self.clips_root = clips_root
@@ -536,20 +647,23 @@ class CsvAudioDataset(Dataset):
 
         if audio.shape[-1] > self.chunk_size:
             start = random.randint(0, audio.shape[-1] - self.chunk_size)
-            chunk = audio[0, start: start + self.chunk_size]
+            chunk = audio[0, start : start + self.chunk_size]
         else:
             chunk = F.pad(audio[0], (0, self.chunk_size - audio.shape[-1]))
 
         # --- Age Processing ---
         age_label = row["age"]
-        age_idx = self.age_to_idx.get(age_label,
-                                      self.age_to_idx["thirties"])  # Default to 30s
+        age_idx = self.age_to_idx.get(
+            age_label, self.age_to_idx["thirties"]
+        )  # Default to 30s
         age_vec = F.one_hot(torch.tensor(age_idx), num_classes=NUM_AGE_CLASSES).float()
 
         # --- Gender Processing ---
         gender_vec = (
-            torch.tensor([0.0, 1.0]) if "female" in row["gender"] else torch.tensor(
-                [1.0, 0.0]))
+            torch.tensor([0.0, 1.0])
+            if "female" in row["gender"]
+            else torch.tensor([1.0, 0.0])
+        )
         return chunk, gender_vec, age_vec
 
 
@@ -558,9 +672,15 @@ class CsvAudioDataset(Dataset):
 # ==========================================
 
 
-def convert_voice(model, input_wav, output_wav, target_gender_balance, target_age_float,
-                  # Changed param name to clarify it's a float 0.0-1.0
-                  pitch_shift=0.0, device="cpu", ):
+def convert_voice(
+    model,
+    input_wav,
+    output_wav,
+    target_gender_balance,
+    target_age_float,  # Changed param name to clarify it's a float 0.0-1.0
+    pitch_shift=0.0,
+    device="cpu",
+):
     audio, sr = torchaudio.load(input_wav)
     if audio.shape[0] > 1:
         audio = torch.mean(audio, dim=0, keepdim=True)
@@ -579,10 +699,6 @@ def convert_voice(model, input_wav, output_wav, target_gender_balance, target_ag
         if pitch_shift != 0.0:
             f0 = f0 * (2 ** (pitch_shift / 12.0))
 
-        # f0 = torch.ones_like(f0) * 110.
-        # t = torch.linspace(0, audio.shape[1] / SAMPLE_RATE, f0.shape[1])
-        # t = t.unsqueeze(0).unsqueeze(-1)
-        # f0 += torch.sin(2 * torch.pi * 4 * t) * f0/5
         # 3. Create Condition Tensors
         frames = f0.shape[1]
 
@@ -600,12 +716,15 @@ def convert_voice(model, input_wav, output_wav, target_gender_balance, target_ag
         controls = model.controller(f0, loud_db, z, g_tensor, a_tensor)
 
         # 5. Decode
-        dry_audio = model.decoder(f0=controls["f0"], amplitude=controls["amplitude"],
-                                  open_quotient=controls["open_quotient"],
-                                  vocal_tract_curve=controls["vocal_tract_curve"],
-                                  noise_filter_curve=controls["noise_filter_curve"],
-                                  target_length=audio.shape[-1], )
-        wet_audio = model.reverb(dry_audio)
+        dry_audio = model.decoder(
+            f0=controls["f0"],
+            amplitude=controls["amplitude"],
+            open_quotient=controls["open_quotient"],
+            vocal_tract_curve=controls["vocal_tract_curve"],
+            noise_filter_curve=controls["noise_filter_curve"],
+            target_length=audio.shape[-1],
+        )
+        wet_audio = self.reverb(dry_audio)
 
     wet_audio = wet_audio.cpu()
     wet_audio = wet_audio / (torch.abs(wet_audio).max() + 1e-6)
@@ -616,17 +735,21 @@ def convert_voice(model, input_wav, output_wav, target_gender_balance, target_ag
 def process_tsv(file_path, output_path):
     # 1. Load the TSV file
     # Polars uses read_csv with a separator argument for TSV
-    df = pl.read_csv(file_path, separator="\t", ignore_errors=True, encoding="utf-8",
-                     quote_char="")
+    df = pl.read_csv(
+        file_path, separator="\t", ignore_errors=True, encoding="utf-8", quote_char=""
+    )
 
     # 2. Apply Filters
     # - path is not null
     # - age is not null
     # - gender is exactly 'male' or 'female'
     filtered_df = df.filter(
-        pl.col("path").is_not_null() & pl.col("age").is_not_null() & pl.col(
-            "gender").is_not_null()).select(
-        ["path", "age", "gender"])  # Discard everything else
+        pl.col("path").is_not_null()
+        & pl.col("age").is_not_null()
+        & pl.col("gender").is_not_null()
+    ).select(
+        ["path", "age", "gender"]
+    )  # Discard everything else
 
     # 3. Inspect results
     print(f"Original rows: {len(df)}")
@@ -649,9 +772,9 @@ def process_tsv(file_path, output_path):
 # ==========================================
 
 # --- Configuration ---
-CSV_PATH = "data/filtered_dataset.csv"
-TSV_PATH = "data/cv-corpus-23.0-2025-09-05/tr/validated.tsv"
-CLIPS_DIR = "data/cv-corpus-23.0-2025-09-05/tr/clips"
+CSV_PATH = "/mnt/data/ai/filtered_dataset.csv"
+TSV_PATH = "/mnt/data/ai/cv-corpus-23.0-2025-09-05/tr/validated.tsv"
+CLIPS_DIR = "/mnt/data/ai/cv-corpus-23.0-2025-09-05/tr/clips"
 CHECKPOINT_DIR = "checkpoints"
 
 DEVICE = "cpu"
@@ -672,24 +795,24 @@ BATCH_SIZE = 16  # Restored variable
 
 # Update this to point to a specific step checkpoint if needed
 CHECKPOINT = f"{CHECKPOINT_DIR}/model_last.pth"
-INPUT_WAV = "/Users/kureta/Music/Random Samples/rumi.wav"
-
+INPUT_WAV = "/mnt/Data/Audio/misc/haiku.mp3"
 
 def training():
     # --- Setup ---
     model = VoiceAutoEncoder(sample_rate=SAMPLE_RATE).to(DEVICE)
 
     # Load Data
-    dataset = CsvAudioDataset(CSV_PATH, CLIPS_DIR, limit=LIMIT,
-                              chunk_size=SAMPLE_RATE * 2)
+    dataset = CsvAudioDataset(CSV_PATH, CLIPS_DIR, limit=LIMIT, chunk_size=SAMPLE_RATE*2)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
 
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     # criterion = MultiScaleSpectralLoss().to(DEVICE)
     fft_sizes = [4096, 2048, 1024, 512, 256]
-    criterion = MultiScaleMelLoss(sample_rate=SAMPLE_RATE, fft_sizes=fft_sizes,
-                                  n_mels=[calculate_max_n_mels(SAMPLE_RATE, nf) for nf in
-                                          fft_sizes], ).to(DEVICE)
+    criterion = MultiScaleMelLoss(
+        sample_rate=SAMPLE_RATE,
+        fft_sizes=fft_sizes,
+        n_mels = [calculate_max_n_mels(SAMPLE_RATE, nf) for nf in fft_sizes],
+    ).to(DEVICE)
 
     print(f"Starting Training on {DEVICE}...")
     print(f"Dataset Size: {len(dataset)} | Batch Size: {BATCH_SIZE}")
@@ -746,7 +869,9 @@ def training():
                     age_idx = torch.argmax(age[ridx]).item()
                     age_str = AGE_LABELS[age_idx]
 
-                    fname_base = (f"{CHECKPOINT_DIR}/step{num_batches}_{g_str}_{age_str}")
+                    fname_base = (
+                        f"{CHECKPOINT_DIR}/step{num_batches}_{g_str}_{age_str}"
+                    )
                     scipy.io.wavfile.write(f"{fname_base}_target.wav", SAMPLE_RATE, tgt)
                     scipy.io.wavfile.write(f"{fname_base}_recon.wav", SAMPLE_RATE, out)
 
@@ -760,15 +885,30 @@ def inference():
     if os.path.exists(CHECKPOINT) and os.path.exists(INPUT_WAV):
         print(f"Loading {CHECKPOINT}...")
         model.load_state_dict(
-            torch.load(CHECKPOINT, map_location=DEVICE, weights_only=True))
+            torch.load(CHECKPOINT, map_location=DEVICE, weights_only=True)
+        )
 
-        convert_voice(model, INPUT_WAV, "generated/output_female.wav", 1.0, 0.4,
-                      pitch_shift=7.0, device=DEVICE, )
-        convert_voice(model, INPUT_WAV, "generated/output_male.wav", 0.0, 0.4,
-                      pitch_shift=-7.0, device=DEVICE, )
+        convert_voice(
+            model,
+            INPUT_WAV,
+            "generated/output_female.wav",
+            1.0,
+            0.4,
+            pitch_shift=7.0,
+            device=DEVICE,
+        )
+        convert_voice(
+            model,
+            INPUT_WAV,
+            "generated/output_male.wav",
+            0.0,
+            0.4,
+            pitch_shift=-7.0,
+            device=DEVICE,
+        )
     else:
         print("Checkpoint or Input Wav not found.")
 
 
 if __name__ == "__main__":
-    inference()
+    training()
