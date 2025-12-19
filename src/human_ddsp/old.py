@@ -287,8 +287,13 @@ class AudioFeatureEncoder(nn.Module):
         
         # Dynamic liftering: keep half of the coefficients
         self.n_mfcc = n_mels // 2
+        
+        # Use nn.Linear for DCT to avoid shape mismatch issues with matmul
+        # DCT matrix is (n_mfcc, n_mels)
         dct_mat = F_audio.create_dct(self.n_mfcc, n_mels, norm="ortho")
-        self.register_buffer("dct_mat", dct_mat)
+        self.dct_layer = nn.Linear(n_mels, self.n_mfcc, bias=False)
+        self.dct_layer.weight.data = dct_mat
+        self.dct_layer.weight.requires_grad = False # Fixed DCT
         
         # Input to RNN is n_mfcc - 1 (dropping 0th coefficient)
         self.rnn = nn.GRU(self.n_mfcc - 1, gru_units, batch_first=True)
@@ -340,11 +345,10 @@ class AudioFeatureEncoder(nn.Module):
         Runs RNN on Mels and applies Temporal Bottleneck.
         Expected mels shape: [Batch, Time, Mels]
         """
-        # Apply DCT to get MFCCs
+        # Apply DCT to get MFCCs using Linear layer
         # mels: [B, T, n_mels]
-        # dct_mat: [n_mfcc, n_mels]
-        # We want: [B, T, n_mfcc]
-        mfcc = torch.matmul(mels, self.dct_mat.t())
+        # output: [B, T, n_mfcc]
+        mfcc = self.dct_layer(mels)
         
         # Drop 0th coefficient (loudness)
         mfcc = mfcc[..., 1:]
